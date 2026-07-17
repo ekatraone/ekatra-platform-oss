@@ -1,0 +1,8 @@
+{
+  "version": 2,
+  "logging_enabled": false,
+  "scm_type": "None",
+  "use_mercurial": false,
+  "site_name": "ekatra-backend",
+  "location": "East US"
+}

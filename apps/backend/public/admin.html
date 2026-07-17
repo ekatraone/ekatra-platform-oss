@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ekatra Admin Panel</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; }
+    .header { background: #1e293b; border-bottom: 1px solid #334155; padding: 1rem 1.5rem; display: flex; align-items: center; justify-content: space-between; }
+    .header h1 { font-size: 1.1rem; font-weight: 600; color: #f8fafc; }
+    .header .tag { font-size: 0.7rem; background: #1d4ed8; color: #bfdbfe; padding: 2px 8px; border-radius: 999px; font-weight: 500; margin-left: 8px; }
+    #logout-btn { font-size: 0.8rem; background: #334155; border: none; color: #94a3b8; padding: 5px 12px; border-radius: 6px; cursor: pointer; }
+    #logout-btn:hover { background: #475569; }
+    .main { max-width: 900px; margin: 0 auto; padding: 1.5rem; }
+    .card { background: #1e293b; border: 1px solid #334155; border-radius: 10px; padding: 1.25rem; margin-bottom: 1.25rem; }
+    .card h2 { font-size: 0.85rem; font-weight: 600; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 1rem; }
+    label { display: block; font-size: 0.8rem; color: #94a3b8; margin-bottom: 4px; margin-top: 10px; }
+    input, select, textarea { width: 100%; background: #0f172a; border: 1px solid #334155; border-radius: 6px; padding: 8px 10px; color: #e2e8f0; font-size: 0.875rem; outline: none; }
+    input:focus, select:focus, textarea:focus { border-color: #3b82f6; }
+    textarea { resize: vertical; min-height: 60px; }
+    .btn { display: inline-block; padding: 8px 16px; border-radius: 6px; border: none; cursor: pointer; font-size: 0.85rem; font-weight: 500; margin-top: 10px; transition: opacity .15s; }
+    .btn:hover { opacity: 0.85; }
+    .btn-primary { background: #3b82f6; color: #fff; }
+    .btn-danger { background: #dc2626; color: #fff; }
+    .btn-secondary { background: #334155; color: #e2e8f0; }
+    .btn-sm { padding: 5px 10px; font-size: 0.78rem; margin-top: 0; }
+    .row { display: flex; gap: 10px; align-items: flex-end; }
+    .row > * { flex: 1; }
+    .row > .btn { flex: 0 0 auto; }
+    .output { margin-top: 0.75rem; background: #0f172a; border: 1px solid #1e3a5f; border-radius: 6px; padding: 10px; font-size: 0.78rem; font-family: 'SF Mono', 'Fira Code', monospace; color: #7dd3fc; white-space: pre-wrap; word-break: break-all; max-height: 280px; overflow-y: auto; display: none; }
+    .output.visible { display: block; }
+    .status-ok { color: #4ade80; }
+    .status-err { color: #f87171; }
+    #login-screen { display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+    #login-box { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 2rem; width: 100%; max-width: 360px; }
+    #login-box h2 { margin-bottom: 1.25rem; font-size: 1rem; color: #f8fafc; }
+    #login-error { color: #f87171; font-size: 0.8rem; margin-top: 8px; display: none; }
+    .badge { display: inline-block; padding: 2px 7px; border-radius: 4px; font-size: 0.7rem; font-weight: 600; }
+    .badge-green { background: #166534; color: #4ade80; }
+    .badge-red { background: #7f1d1d; color: #fca5a5; }
+    .badge-yellow { background: #713f12; color: #fcd34d; }
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+
+<!-- LOGIN SCREEN -->
+<div id="login-screen">
+  <div id="login-box">
+    <h2>🦊 Ekatra Admin</h2>
+    <label>Email</label>
+    <input type="email" id="login-email" placeholder="admin@ekatra.one" autocomplete="username">
+    <label>Password</label>
+    <input type="password" id="login-password" autocomplete="current-password">
+    <button id="login-btn" class="btn btn-primary" style="width:100%;margin-top:16px">Sign In</button>
+    <div id="login-error">Invalid credentials</div>
+  </div>
+</div>
+
+<!-- MAIN APP -->
+<div id="app-screen" class="hidden">
+  <div class="header">
+    <div>
+      <span>🦊 Ekatra Admin</span>
+      <span class="tag">Internal</span>
+    </div>
+    <button id="logout-btn">Sign out</button>
+  </div>
+
+  <div class="main">
+
+    <!-- LEARNER STATE -->
+    <div class="card">
+      <h2>Learner State</h2>
+      <div class="row">
+        <div>
+          <label>Learner ID (UUID)</label>
+          <input type="text" id="state-learner-id" placeholder="e.g. abc123...">
+        </div>
+        <button id="get-state-btn" class="btn btn-secondary btn-sm">Get State</button>
+      </div>
+      <div class="output" id="state-output"></div>
+    </div>
+
+    <!-- SIMULATE -->
+    <div class="card">
+      <h2>Simulate Learner Interaction</h2>
+      <div class="row">
+        <div>
+          <label>Phone number (E.164)</label>
+          <input type="text" id="sim-phone" placeholder="+917XXXXXXXXX">
+        </div>
+        <div>
+          <label>Button / Message payload</label>
+          <input type="text" id="sim-payload" placeholder="Start Lesson">
+        </div>
+      </div>
+      <label>Message type</label>
+      <select id="sim-type">
+        <option value="button">button (quick reply)</option>
+        <option value="text">text</option>
+      </select>
+      <button id="simulate-btn" class="btn btn-primary">Run Simulation</button>
+      <div class="output" id="sim-output"></div>
+    </div>
+
+    <!-- SEND MESSAGE -->
+    <div class="card">
+      <h2>Send Message to Learner</h2>
+      <div class="row">
+        <div>
+          <label>Learner ID</label>
+          <input type="text" id="send-learner-id" placeholder="UUID">
+        </div>
+        <div>
+          <label>Message type</label>
+          <select id="send-type">
+            <option value="text">text</option>
+            <option value="template">template</option>
+          </select>
+        </div>
+      </div>
+      <label>Content / Template name</label>
+      <textarea id="send-content" placeholder="Message body..."></textarea>
+      <button id="send-msg-btn" class="btn btn-primary">Send</button>
+      <div class="output" id="send-output"></div>
+    </div>
+
+    <!-- RESET LEARNER -->
+    <div class="card">
+      <h2>Reset Learner State</h2>
+      <p style="font-size:0.8rem;color:#94a3b8;margin-bottom:10px">Clears FSM state and progress. Use for re-testing. Irreversible.</p>
+      <div class="row">
+        <div>
+          <label>Learner ID</label>
+          <input type="text" id="reset-learner-id" placeholder="UUID">
+        </div>
+        <div>
+          <label>Course ID (optional)</label>
+          <input type="text" id="reset-course-id" placeholder="UUID or leave blank">
+        </div>
+        <button id="reset-learner-btn" class="btn btn-danger btn-sm">Reset</button>
+      </div>
+      <div class="output" id="reset-output"></div>
+    </div>
+
+    <!-- HEALTH -->
+    <div class="card">
+      <h2>System Health</h2>
+      <button id="check-health-btn" class="btn btn-secondary btn-sm">Check /health/ready</button>
+      <div class="output" id="health-output"></div>
+    </div>
+
+  </div>
+</div>
+
+<script src="/admin/admin.js" defer></script>
+</body>
+</html>

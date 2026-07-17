@@ -1,0 +1,22 @@
+{
+  "name": "@ekatra/messaging",
+  "version": "1.0.0",
+  "description": "WhatsApp Cloud API messaging provider for Ekatra",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc -w"
+  },
+  "dependencies": {
+    "node-fetch": "^3.3.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "typescript": "^5.3.0"
+  },
+  "peerDependencies": {
+    "@ekatra/database": "workspace:*"
+  }
+}

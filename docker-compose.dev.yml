@@ -1,0 +1,51 @@
+version: '3.8'
+
+# Development compose - starts just DB and Redis locally
+# Backend runs via pnpm dev for hot reload
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: ekatra-postgres-dev
+    environment:
+      POSTGRES_DB: ekatra
+      POSTGRES_USER: ekatra
+      POSTGRES_PASSWORD: ekatra_dev_password
+    volumes:
+      - postgres_dev_data:/var/lib/postgresql/data
+      - ./packages/database/src/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ekatra"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: ekatra-redis-dev
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Optional: pgAdmin for database management
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: ekatra-pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@ekatra.one
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "5050:80"
+    depends_on:
+      - postgres
+    profiles:
+      - tools
+
+volumes:
+  postgres_dev_data:

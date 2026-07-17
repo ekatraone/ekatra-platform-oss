@@ -1,0 +1,34 @@
+{
+  "name": "ekatra-platform",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Ekatra - WhatsApp-first micro-learning platform",
+  "scripts": {
+    "setup": "chmod +x scripts/*.sh && ./scripts/setup.sh",
+    "dev": "pnpm --filter @ekatra/backend dev",
+    "dev:frontend": "pnpm --filter @ekatra/frontend dev",
+    "dev:all": "pnpm -r --parallel run dev",
+    "build": "pnpm -r run build",
+    "build:backend": "pnpm --filter @ekatra/backend build",
+    "build:frontend": "pnpm --filter @ekatra/frontend build",
+    "build:packages": "pnpm --filter @ekatra/database build && pnpm --filter @ekatra/messaging build",
+    "start": "pnpm --filter @ekatra/backend start",
+    "start:frontend": "pnpm --filter @ekatra/frontend start",
+    "lint": "pnpm -r run lint",
+    "test": "pnpm -r run test",
+    "docker:dev": "docker-compose -f docker-compose.dev.yml up -d",
+    "docker:dev:down": "docker-compose -f docker-compose.dev.yml down",
+    "docker:build": "docker-compose build",
+    "docker:prod": "docker-compose up -d",
+    "docker:logs": "docker-compose -f docker-compose.dev.yml logs -f",
+    "db:migrate": "pnpm --filter @ekatra/database run migrate",
+    "db:seed": "pnpm --filter @ekatra/database run seed"
+  },
+  "keywords": ["ekatra", "whatsapp", "learning", "education", "microlearning"],
+  "author": "Ekatra Team",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0",
+    "pnpm": ">=8.0.0"
+  }
+}
