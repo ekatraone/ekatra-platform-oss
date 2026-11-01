@@ -202,11 +202,12 @@ Today it is standalone; syncing it with the platform (courses in, progress out) 
 
 ## 5. MicroLearn (separate product)
 
-A Lovable-built web app with Supabase as the backend; **not** part of the platform codebase.
+A Lovable-built web app on Supabase; **not** part of the platform codebase.
 
-- **Frontend:** TanStack Start and Router, React Query, Tailwind. Staff portal for courses, learners, chat history, WhatsApp and Telegram settings.
-- **Backend:** Supabase Postgres (12 migrations), Auth, and edge functions: `whatsapp-webhook`, `whatsapp-api`, `whatsapp-template-monitor`, `telegram-webhook`, `ai-tutor`, `generate-embedding`, `find-similar-resources`, `admin-user-management`, `demo-auth`.
-- **AI:** Lovable AI for the tutor and embeddings.
+- **App:** TanStack Start and Router (React, React Query, Tailwind) with server functions (`*.functions.ts` callable from the UI, `*.server.ts` service-role only). Staff portal for courses, flows, learners, chat history, WhatsApp and Telegram settings; web learners at `/learn`.
+- **Engines:** pure `course-engine` (lesson, question, feedback, pause/resume) and `flow-engine` (versioned WhatsApp flows). Each step is committed with its outgoing messages before sending (`apply_whatsapp_step`, `apply_flow_step`).
+- **Backend:** Supabase Postgres (12 migrations, pg_cron scheduler every 5 minutes), Auth, and edge functions kept as the rollback path: `whatsapp-webhook`, `whatsapp-api`, `whatsapp-template-monitor`, `telegram-webhook`, `ai-tutor`, `generate-embedding`, `find-similar-resources`, `admin-user-management`, `demo-auth`.
+- **Channels:** one delivery channel per course (WhatsApp, Telegram or web).
 
 It overlaps the platform in features (WhatsApp delivery, tutor, course editor) but shares no code. A longer-term decision is whether its admin UI becomes a front end over the platform.
 
