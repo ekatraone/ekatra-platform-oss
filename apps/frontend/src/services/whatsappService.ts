@@ -3,23 +3,25 @@
  */
 
 import { api } from './apiClient';
+import { fetchAllPages } from '@/lib/api/pagination';
 
-export const sendWhatsAppMessage = async (phone: string, message: string) => {
+// Addressed by learner id (not phone): /api/learners/:id/send-message looks the learner up by id.
+export const sendWhatsAppMessage = async (learnerId: string, message: string) => {
   try {
-    return await api.sendMessage(phone, { type: 'text', content: message });
+    return await api.sendMessage(learnerId, { type: 'text', content: message });
   } catch (error) {
     console.error("Error sending WhatsApp message:", error);
     throw error;
   }
 };
 
-export const sendTestMessage = async (phone: string, message?: string) => {
-  return sendWhatsAppMessage(phone, message || 'Test message from Ekatra');
+export const sendTestMessage = async (learnerId: string, message?: string) => {
+  return sendWhatsAppMessage(learnerId, message || 'Test message from Ekatra');
 };
 
 export const getWhatsAppChatHistory = async (phone: string) => {
   try {
-    return await api.getChatHistory(phone);
+    return (await api.getChatHistory(phone)).data;
   } catch (error) {
     console.error("Error fetching chat history:", error);
     return [];
@@ -44,8 +46,8 @@ export const fetchWhatsAppTemplates = async () => {
 
 export const fetchContacts = async () => {
   try {
-    const response = await api.getLearners({ limit: 1000 }) as any;
-    return response?.data || [];
+    // The server serves at most 100 rows per page; walk them all.
+    return await fetchAllPages((page, limit) => api.getLearners({ page, limit }) as any);
   } catch (error) {
     console.error("Error fetching contacts:", error);
     return [];

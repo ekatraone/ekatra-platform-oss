@@ -22,7 +22,7 @@ schedulesRouter.get('/', async (req: Request, res: Response) => {
     const db = await getDb();
     const { courseId } = req.query;
     
-    const schedules = await db.schedules.findAll(courseId as string);
+    const schedules = await db.schedules.findAll(courseId as string, req.auth!.organizationId);
     res.json({ success: true, data: schedules });
   } catch (error) {
     logger.error('Error fetching schedules:', error);
@@ -44,8 +44,12 @@ schedulesRouter.get('/logs', async (req: Request, res: Response) => {
     // schedule_execution_logs table may not exist yet — return empty list gracefully
     try {
       const result = await db.raw(
-        `SELECT * FROM schedule_execution_logs ORDER BY executed_at DESC LIMIT $1 OFFSET $2`,
-        [limit, offset]
+        `SELECT logs.* FROM schedule_execution_logs logs
+         JOIN schedules s ON s.id = logs.schedule_id
+         JOIN courses c ON c.id = s.course_id
+         WHERE c.organization_id = $1
+         ORDER BY logs.executed_at DESC LIMIT $2 OFFSET $3`,
+        [req.auth!.organizationId, limit, offset]
       );
       res.json({ success: true, data: result.rows });
     } catch {
@@ -66,7 +70,7 @@ schedulesRouter.get('/:id', async (req: Request, res: Response) => {
     const db = await getDb();
     const { id } = req.params;
     
-    const schedule = await db.schedules.findById(id);
+    const schedule = await db.schedules.findById(id, req.auth!.organizationId);
     if (!schedule) {
       return res.status(404).json({ success: false, error: 'Schedule not found' });
     }
@@ -93,6 +97,9 @@ schedulesRouter.post('/', async (req: Request, res: Response) => {
         error: 'courseId and name are required' 
       });
     }
+
+    const course = await db.courses.findById(courseId, req.auth!.organizationId);
+    if (!course) return res.status(404).json({ success: false, error: 'Course not found' });
 
     const schedule = await db.schedules.create({
       courseId,
@@ -129,7 +136,7 @@ schedulesRouter.put('/:id', async (req: Request, res: Response) => {
       sendTime,
       timezone,
       isActive
-    });
+    }, req.auth!.organizationId);
 
     if (!schedule) {
       return res.status(404).json({ success: false, error: 'Schedule not found' });
@@ -152,7 +159,9 @@ schedulesRouter.delete('/:id', async (req: Request, res: Response) => {
     const db = await getDb();
     const { id } = req.params;
 
-    await db.schedules.delete(id);
+    const schedule = await db.schedules.findById(id, req.auth!.organizationId);
+    if (!schedule) return res.status(404).json({ success: false, error: 'Schedule not found' });
+    await db.schedules.delete(id, req.auth!.organizationId);
     logger.info(`Schedule deleted: ${id}`);
     
     res.json({ success: true });
@@ -168,8 +177,12 @@ schedulesRouter.delete('/:id', async (req: Request, res: Response) => {
  */
 schedulesRouter.post('/:id/execute', async (req: Request, res: Response) => {
   try {
+    const db = await getDb();
     const scheduler = await getScheduler();
     const { id } = req.params;
+
+    const schedule = await db.schedules.findById(id, req.auth!.organizationId);
+    if (!schedule) return res.status(404).json({ success: false, error: 'Schedule not found' });
 
     const result = await scheduler.executeNow(id);
     
@@ -187,8 +200,12 @@ schedulesRouter.post('/:id/execute', async (req: Request, res: Response) => {
  */
 schedulesRouter.post('/:id/trigger', async (req: Request, res: Response) => {
   try {
+    const db = await getDb();
     const scheduler = await getScheduler();
     const { id } = req.params;
+
+    const schedule = await db.schedules.findById(id, req.auth!.organizationId);
+    if (!schedule) return res.status(404).json({ success: false, error: 'Schedule not found' });
 
     const result = await scheduler.executeNow(id);
 
@@ -209,7 +226,7 @@ schedulesRouter.post('/:id/pause', async (req: Request, res: Response) => {
     const db = await getDb();
     const { id } = req.params;
 
-    const schedule = await db.schedules.update(id, { isActive: false });
+    const schedule = await db.schedules.update(id, { isActive: false }, req.auth!.organizationId);
     if (!schedule) {
       return res.status(404).json({ success: false, error: 'Schedule not found' });
     }
@@ -231,7 +248,7 @@ schedulesRouter.post('/:id/resume', async (req: Request, res: Response) => {
     const db = await getDb();
     const { id } = req.params;
 
-    const schedule = await db.schedules.update(id, { isActive: true });
+    const schedule = await db.schedules.update(id, { isActive: true }, req.auth!.organizationId);
     if (!schedule) {
       return res.status(404).json({ success: false, error: 'Schedule not found' });
     }
@@ -255,6 +272,9 @@ schedulesRouter.get('/:id/logs', async (req: Request, res: Response) => {
     const page = Math.max(1, Number(req.query.page) || 1);
     const limit = Math.min(100, Math.max(1, Number(req.query.limit) || 50));
     const offset = (page - 1) * limit;
+
+    const schedule = await db.schedules.findById(id, req.auth!.organizationId);
+    if (!schedule) return res.status(404).json({ success: false, error: 'Schedule not found' });
 
     // schedule_execution_logs table may not exist yet — return empty list gracefully
     try {

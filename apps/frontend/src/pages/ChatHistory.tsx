@@ -1,41 +1,71 @@
 
-import { useState, useEffect } from "react";
+import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import Sidebar from "@/components/dashboard/Sidebar";
+import ListPager from "@/components/dashboard/ListPager";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Search, MessageSquare, Send, Loader2, BookOpen } from "lucide-react";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { apiClient } from "@/services/apiClient";
-import { useWhatsAppChat, useTelegramChat } from "@/hooks/useChatHistory";
+import { fetchAllCourseRecords } from "@/lib/api";
+import { useLearnerChat } from "@/hooks/useChatHistory";
+import { usePagedLearners } from "@/hooks/usePagedLearners";
 import { Textarea } from "@/components/ui/textarea";
 import { useToast } from "@/components/ui/use-toast";
 import { Badge } from "@/components/ui/badge";
 
+// Rows from GET /api/learners. Telegram learners are stored with phone "tg:<chat_id>".
+interface ChatLearner {
+  id: string;
+  name?: string | null;
+  phone: string;
+  created_at?: string;
+  updated_at?: string;
+}
+
+type Platform = "whatsapp" | "telegram";
+
+const platformOf = (l: ChatLearner): Platform => ((l.phone || "").startsWith("tg:") ? "telegram" : "whatsapp");
+const handleOf = (l: ChatLearner) => (platformOf(l) === "telegram" ? `Telegram ${l.phone.slice(3)}` : l.phone);
+const titleOf = (l: ChatLearner) => l.name || handleOf(l);
+const formatDate = (iso?: string) => (iso ? new Date(iso).toLocaleDateString() : "—");
+
 const ChatHistory = () => {
   const { toast } = useToast();
-  const [selectedPlatform, setSelectedPlatform] = useState<"all" | "whatsapp" | "telegram">("all");
-  const [searchQuery, setSearchQuery] = useState("");
-  const [selectedChat, setSelectedChat] = useState<any>(null);
+  const [selectedPlatform, setSelectedPlatform] = useState<"all" | Platform>("all");
+  const [selectedChat, setSelectedChat] = useState<ChatLearner | null>(null);
   const [chatModalOpen, setChatModalOpen] = useState(false);
   const [newMessage, setNewMessage] = useState("");
-  const [enrollTarget, setEnrollTarget] = useState<any>(null);
+  const [isSending, setIsSending] = useState(false);
+  const [enrollTarget, setEnrollTarget] = useState<ChatLearner | null>(null);
   const [enrollModalOpen, setEnrollModalOpen] = useState(false);
   const [selectedCourseId, setSelectedCourseId] = useState("");
   const [isEnrolling, setIsEnrolling] = useState(false);
 
+  // Course picker needs every published course, not just the first page.
   const { data: coursesData } = useQuery({
-    queryKey: ['courses-list'],
-    queryFn: async () => {
-      const res = await apiClient.getCourses({ status: 'published' }) as any;
-      return res?.data || [];
-    }
+    queryKey: ['courses', 'published-picker'],
+    queryFn: () => fetchAllCourseRecords({ status: 'published' }),
   });
 
-  const handleOpenEnroll = (e: React.MouseEvent, chat: any) => {
+  // One server-side page of learners; search runs on the server across all learners.
+  const {
+    learners, pagination, loading, fetching, error: learnersError,
+    search: searchQuery, setSearch: setSearchQuery, setPage,
+  } = usePagedLearners<ChatLearner>();
+
+  const {
+    messages,
+    isLoading: loadingMessages,
+    error: messagesError,
+    sendMessage,
+  } = useLearnerChat(selectedChat?.id);
+
+  const handleOpenEnroll = (e: React.MouseEvent, chat: ChatLearner) => {
     e.stopPropagation();
     setEnrollTarget(chat);
     setSelectedCourseId("");
@@ -56,100 +86,85 @@ const ChatHistory = () => {
     }
   };
 
-  // WhatsApp chat hook
-  const {
-    messages: whatsappMessages,
-    isLoading: loadingWhatsappMessages,
-    sendMessage: sendWhatsAppMessage,
-    refetch: refetchWhatsAppMessages
-  } = useWhatsAppChat(selectedChat?.phone_number);
-
-  // Telegram chat hook
-  const {
-    updates: telegramUpdates,
-    isLoading: loadingTelegramMessages,
-    sendMessage: sendTelegramMessage,
-    refetch: refetchTelegramMessages
-  } = useTelegramChat(selectedChat?.chat_id?.toString());
-
-  const { data: whatsappChats, isLoading: loadingWhatsapp } = useQuery({
-    queryKey: ['whatsapp-chats'],
-    queryFn: async () => {
-      const response = await apiClient.get('/api/learners?platform=whatsapp');
-      return response.data || [];
-    }
-  });
-
-  const { data: telegramChats, isLoading: loadingTelegram } = useQuery({
-    queryKey: ['telegram-chats'],
-    queryFn: async () => {
-      const response = await apiClient.get('/api/learners?platform=telegram');
-      return response.data || [];
-    }
-  });
-
   const handleSendMessage = async () => {
-    if (!newMessage.trim() || !selectedChat) return;
-
+    if (!newMessage.trim() || !selectedChat || isSending) return;
+    setIsSending(true);
     try {
-      if (selectedChat.phone_number) {
-        // Send WhatsApp message
-        await sendWhatsAppMessage(newMessage);
-        toast({
-          title: "Message sent",
-          description: "Your WhatsApp message has been sent"
-        });
-      } else if (selectedChat.chat_id) {
-        // Send Telegram message
-        await sendTelegramMessage(newMessage);
-        toast({
-          title: "Message sent",
-          description: "Your Telegram message has been sent"
-        });
-      }
-      
+      await sendMessage(newMessage);
+      toast({
+        title: "Message sent",
+        description: `Your ${platformOf(selectedChat) === "telegram" ? "Telegram" : "WhatsApp"} message has been sent`,
+      });
       setNewMessage("");
     } catch (error) {
-      console.error("Error sending message:", error);
+      // Keep the typed text so the admin can retry.
       toast({
         title: "Error sending message",
-        description: "There was a problem sending your message",
+        description: (error as Error).message || "There was a problem sending your message",
         variant: "destructive"
       });
+    } finally {
+      setIsSending(false);
     }
   };
 
-  const handleOpenChat = (chat: any) => {
+  const handleOpenChat = (chat: ChatLearner) => {
     setSelectedChat(chat);
+    setNewMessage("");
     setChatModalOpen(true);
-    
-    // Refresh messages/updates when opening a chat
-    if (chat.phone_number) {
-      refetchWhatsAppMessages();
-    } else if (chat.chat_id) {
-      refetchTelegramMessages();
-    }
   };
 
-  const filteredChats = () => {
-    let chats = [];
-    
-    if (selectedPlatform === "all" || selectedPlatform === "whatsapp") {
-      chats.push(...(whatsappChats || []));
-    }
-    
-    if (selectedPlatform === "all" || selectedPlatform === "telegram") {
-      chats.push(...(telegramChats || []));
-    }
-    
-    if (searchQuery) {
-      chats = chats.filter(chat => 
-        chat.phone_number?.toLowerCase().includes(searchQuery.toLowerCase()) ||
-        chat.chat_id?.toLowerCase().includes(searchQuery.toLowerCase())
-      );
-    }
-    
-    return chats;
+  // Platform tabs filter the current page; search and paging happen on the server.
+  const chatsFor = (platform: "all" | Platform) =>
+    platform === "all" ? learners : learners.filter((l) => platformOf(l) === platform);
+
+  const renderList = (platform: "all" | Platform) => {
+    const chats = chatsFor(platform);
+    return (
+      <>
+        {chats.map((chat) => (
+          <Card key={chat.id} className="p-4 hover:bg-accent/50 transition-colors cursor-pointer" onClick={() => handleOpenChat(chat)}>
+            <div className="flex items-center justify-between">
+              <div>
+                <h3 className="font-medium flex items-center gap-2">
+                  {titleOf(chat)}
+                  <Badge variant="outline" className="ml-2">
+                    {platformOf(chat) === "telegram" ? 'Telegram' : 'WhatsApp'}
+                  </Badge>
+                </h3>
+                <p className="text-sm text-muted-foreground">
+                  {chat.name ? `${handleOf(chat)} · ` : ""}Last updated: {formatDate(chat.updated_at || chat.created_at)}
+                </p>
+              </div>
+              <div className="flex items-center gap-1">
+                <Button variant="ghost" size="icon" title="Enroll in course" onClick={(e) => handleOpenEnroll(e, chat)}>
+                  <BookOpen className="h-4 w-4" />
+                </Button>
+                <Button variant="ghost" size="icon">
+                  <MessageSquare className="h-4 w-4" />
+                </Button>
+              </div>
+            </div>
+          </Card>
+        ))}
+
+        {chats.length === 0 && !loading && (
+          <div className="text-center py-8">
+            <p className="text-muted-foreground">
+              {learnersError ? `Failed to load conversations: ${learnersError.message}` : "No conversations found"}
+            </p>
+          </div>
+        )}
+
+        {loading && (
+          <div className="flex justify-center py-8">
+            <Loader2 className="h-6 w-6 animate-spin text-primary" />
+          </div>
+        )}
+
+        <ListPager pagination={pagination} onPageChange={setPage} disabled={fetching} />
+      </>
+    );
   };
 
   return (
@@ -168,7 +183,7 @@ const ChatHistory = () => {
             <div className="relative">
               <Search className="absolute left-2 top-2.5 h-4 w-4 text-muted-foreground" />
               <Input
-                placeholder="Search conversations..."
+                placeholder="Search by name or phone..."
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
                 className="pl-8"
@@ -184,117 +199,13 @@ const ChatHistory = () => {
             </TabsList>
 
             <TabsContent value="all" className="space-y-4 mt-4">
-              {filteredChats().map((chat) => (
-                <Card key={chat.id} className="p-4 hover:bg-accent/50 transition-colors cursor-pointer" onClick={() => handleOpenChat(chat)}>
-                  <div className="flex items-center justify-between">
-                    <div>
-                      <h3 className="font-medium flex items-center gap-2">
-                        {chat.phone_number || chat.chat_id}
-                        <Badge variant="outline" className="ml-2">
-                          {chat.phone_number ? 'WhatsApp' : 'Telegram'}
-                        </Badge>
-                      </h3>
-                      <p className="text-sm text-muted-foreground">
-                        Last active: {new Date(chat.last_interaction_at).toLocaleDateString()}
-                      </p>
-                    </div>
-                    <div className="flex items-center gap-1">
-                      <Button variant="ghost" size="icon" title="Enroll in course" onClick={(e) => handleOpenEnroll(e, chat)}>
-                        <BookOpen className="h-4 w-4" />
-                      </Button>
-                      <Button variant="ghost" size="icon">
-                        <MessageSquare className="h-4 w-4" />
-                      </Button>
-                    </div>
-                  </div>
-                </Card>
-              ))}
-              
-              {filteredChats().length === 0 && !loadingWhatsapp && !loadingTelegram && (
-                <div className="text-center py-8">
-                  <p className="text-muted-foreground">No conversations found</p>
-                </div>
-              )}
-              
-              {(loadingWhatsapp || loadingTelegram) && (
-                <div className="flex justify-center py-8">
-                  <Loader2 className="h-6 w-6 animate-spin text-primary" />
-                </div>
-              )}
+              {selectedPlatform === "all" && renderList("all")}
             </TabsContent>
-
             <TabsContent value="whatsapp" className="space-y-4 mt-4">
-              {(whatsappChats || [])
-                .filter(chat => !searchQuery || chat.phone_number?.toLowerCase().includes(searchQuery.toLowerCase()))
-                .map((chat) => (
-                <Card key={chat.id} className="p-4 hover:bg-accent/50 transition-colors cursor-pointer" onClick={() => handleOpenChat(chat)}>
-                  <div className="flex items-center justify-between">
-                    <div>
-                      <h3 className="font-medium">{chat.phone_number}</h3>
-                      <p className="text-sm text-muted-foreground">
-                        Last active: {new Date(chat.last_interaction_at).toLocaleDateString()}
-                      </p>
-                    </div>
-                    <div className="flex items-center gap-1">
-                      <Button variant="ghost" size="icon" title="Enroll in course" onClick={(e) => handleOpenEnroll(e, chat)}>
-                        <BookOpen className="h-4 w-4" />
-                      </Button>
-                      <Button variant="ghost" size="icon">
-                        <MessageSquare className="h-4 w-4" />
-                      </Button>
-                    </div>
-                  </div>
-                </Card>
-              ))}
-              
-              {whatsappChats?.length === 0 && !loadingWhatsapp && (
-                <div className="text-center py-8">
-                  <p className="text-muted-foreground">No WhatsApp conversations found</p>
-                </div>
-              )}
-              
-              {loadingWhatsapp && (
-                <div className="flex justify-center py-8">
-                  <Loader2 className="h-6 w-6 animate-spin text-primary" />
-                </div>
-              )}
+              {selectedPlatform === "whatsapp" && renderList("whatsapp")}
             </TabsContent>
-
             <TabsContent value="telegram" className="space-y-4 mt-4">
-              {(telegramChats || [])
-                .filter(chat => !searchQuery || chat.chat_id?.toLowerCase().includes(searchQuery.toLowerCase()))
-                .map((chat) => (
-                <Card key={chat.id} className="p-4 hover:bg-accent/50 transition-colors cursor-pointer" onClick={() => handleOpenChat(chat)}>
-                  <div className="flex items-center justify-between">
-                    <div>
-                      <h3 className="font-medium">{chat.chat_id}</h3>
-                      <p className="text-sm text-muted-foreground">
-                        Last active: {new Date(chat.last_interaction_at).toLocaleDateString()}
-                      </p>
-                    </div>
-                    <div className="flex items-center gap-1">
-                      <Button variant="ghost" size="icon" title="Enroll in course" onClick={(e) => handleOpenEnroll(e, chat)}>
-                        <BookOpen className="h-4 w-4" />
-                      </Button>
-                      <Button variant="ghost" size="icon">
-                        <MessageSquare className="h-4 w-4" />
-                      </Button>
-                    </div>
-                  </div>
-                </Card>
-              ))}
-              
-              {telegramChats?.length === 0 && !loadingTelegram && (
-                <div className="text-center py-8">
-                  <p className="text-muted-foreground">No Telegram conversations found</p>
-                </div>
-              )}
-              
-              {loadingTelegram && (
-                <div className="flex justify-center py-8">
-                  <Loader2 className="h-6 w-6 animate-spin text-primary" />
-                </div>
-              )}
+              {selectedPlatform === "telegram" && renderList("telegram")}
             </TabsContent>
           </Tabs>
         </div>
@@ -305,67 +216,41 @@ const ChatHistory = () => {
         <DialogContent className="sm:max-w-[500px] max-h-[80vh] flex flex-col">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
-              {selectedChat?.phone_number || selectedChat?.chat_id}
+              {selectedChat && titleOf(selectedChat)}
               <Badge variant="outline">
-                {selectedChat?.phone_number ? 'WhatsApp' : 'Telegram'}
+                {selectedChat && platformOf(selectedChat) === "telegram" ? 'Telegram' : 'WhatsApp'}
               </Badge>
             </DialogTitle>
           </DialogHeader>
-          
+
           <div className="flex-1 overflow-y-auto my-4 p-3 bg-muted/50 rounded-md min-h-[300px] max-h-[400px]">
-            {selectedChat?.phone_number ? (
-              // WhatsApp Messages
-              loadingWhatsappMessages ? (
-                <div className="flex justify-center items-center h-full">
-                  <Loader2 className="h-6 w-6 animate-spin text-primary" />
+            {loadingMessages ? (
+              <div className="flex justify-center items-center h-full">
+                <Loader2 className="h-6 w-6 animate-spin text-primary" />
+              </div>
+            ) : messagesError ? (
+              <p className="text-center text-destructive">Failed to load messages: {messagesError.message}</p>
+            ) : messages.length > 0 ? (
+              messages.map((msg) => (
+                <div
+                  key={msg.id}
+                  className={`mb-2 p-2 rounded-lg ${
+                    msg.direction === 'outbound' ? 'ml-auto bg-primary/10' : 'mr-auto bg-secondary/10'
+                  } max-w-[80%]`}
+                >
+                  <p className="text-sm">{msg.content || `[${msg.message_type}]`}</p>
+                  <span className="text-xs text-muted-foreground">
+                    {new Date(msg.created_at).toLocaleString()}
+                  </span>
                 </div>
-              ) : whatsappMessages.length > 0 ? (
-                whatsappMessages.map((msg, idx) => (
-                  <div 
-                    key={idx}
-                    className={`mb-2 p-2 rounded-lg ${
-                      msg.sent ? 'ml-auto bg-primary/10' : 'mr-auto bg-secondary/10'
-                    } max-w-[80%]`}
-                  >
-                    <p className="text-sm">{msg.content}</p>
-                    <span className="text-xs text-muted-foreground">
-                      {new Date(msg.timestamp).toLocaleTimeString()}
-                    </span>
-                  </div>
-                ))
-              ) : (
-                <p className="text-center text-muted-foreground">No messages to display</p>
-              )
+              ))
             ) : (
-              // Telegram Updates
-              loadingTelegramMessages ? (
-                <div className="flex justify-center items-center h-full">
-                  <Loader2 className="h-6 w-6 animate-spin text-primary" />
-                </div>
-              ) : telegramUpdates.length > 0 ? (
-                telegramUpdates
-                  .filter((update) => update.message)
-                  .map((update, idx) => (
-                    <div 
-                      key={idx}
-                      className={`mb-2 p-2 rounded-lg ${
-                        update.message.from.is_bot ? 'ml-auto bg-primary/10' : 'mr-auto bg-secondary/10'
-                      } max-w-[80%]`}
-                    >
-                      <p className="text-sm">{update.message.text}</p>
-                      <span className="text-xs text-muted-foreground">
-                        {new Date(update.message.date * 1000).toLocaleTimeString()}
-                      </span>
-                    </div>
-                  ))
-              ) : (
-                <p className="text-center text-muted-foreground">No messages to display</p>
-              )
+              <p className="text-center text-muted-foreground">No messages to display</p>
             )}
           </div>
-          
+
           <div className="flex gap-2">
-            <Textarea 
+            <Textarea
               placeholder="Type your message..."
               value={newMessage}
               onChange={(e) => setNewMessage(e.target.value)}
@@ -377,8 +262,8 @@ const ChatHistory = () => {
                 }
               }}
             />
-            <Button onClick={handleSendMessage} type="submit">
-              <Send className="h-4 w-4" />
+            <Button onClick={handleSendMessage} type="submit" disabled={isSending || !newMessage.trim()}>
+              {isSending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Send className="h-4 w-4" />}
             </Button>
           </div>
         </DialogContent>
@@ -392,7 +277,7 @@ const ChatHistory = () => {
           </DialogHeader>
           <div className="space-y-4 py-2">
             <p className="text-sm text-muted-foreground">
-              Learner: <span className="font-medium">{enrollTarget?.phone_number || enrollTarget?.chat_id}</span>
+              Learner: <span className="font-medium">{enrollTarget && titleOf(enrollTarget)}</span>
             </p>
             <div className="space-y-2">
               <label className="text-sm font-medium">Select Course</label>
@@ -401,7 +286,7 @@ const ChatHistory = () => {
                   <SelectValue placeholder="Choose a course..." />
                 </SelectTrigger>
                 <SelectContent>
-                  {(coursesData || []).map((c: any) => (
+                  {(coursesData || []).map((c) => (
                     <SelectItem key={c.id} value={c.id}>{c.title}</SelectItem>
                   ))}
                 </SelectContent>

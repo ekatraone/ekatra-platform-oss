@@ -7,11 +7,44 @@
 
 import { Router, Request, Response } from 'express';
 import { logger } from '../lib/logger.js';
+import { requireRole } from '../middleware/auth.js';
 
 const getDb = () => import('@ekatra/database').then(m => m.db);
 const getFSM = () => import('../flows/conversationFSM.js').then(m => m.ConversationFSM);
 
 export const adminRouter: Router = Router();
+adminRouter.use(requireRole('admin', 'super_admin'));
+
+// Delivery recovery is cross-tenant operational data, so only a super-admin
+// may inspect or replay it. Payloads are deliberately excluded from responses.
+adminRouter.get('/webhook-receipts/failed', requireRole('super_admin'), async (req: Request, res: Response) => {
+  try {
+    const parsedLimit = Number.parseInt(String(req.query.limit ?? '50'), 10);
+    const limit = Number.isFinite(parsedLimit) ? parsedLimit : 50;
+    const db = await getDb();
+    const receipts = await db.webhookReceipts.findFailed(limit);
+    res.json({ success: true, data: receipts });
+  } catch (error) {
+    logger.error('Admin: failed to list webhook receipts:', error);
+    res.status(500).json({ success: false, error: 'Failed to list webhook receipts' });
+  }
+});
+
+adminRouter.post('/webhook-receipts/:id/replay', requireRole('super_admin'), async (req: Request, res: Response) => {
+  try {
+    const db = await getDb();
+    const receipt = await db.webhookReceipts.requestReplay(req.params.id, req.auth!.userId);
+    if (!receipt) {
+      res.status(409).json({ success: false, error: 'Receipt is not failed or does not exist' });
+      return;
+    }
+    logger.warn(`Admin ${req.auth!.userId} requested webhook receipt replay ${receipt.id}`);
+    res.json({ success: true, data: receipt });
+  } catch (error) {
+    logger.error('Admin: failed to request webhook replay:', error);
+    res.status(500).json({ success: false, error: 'Failed to request webhook replay' });
+  }
+});
 
 // ─── GET /api/admin/learners/:id/state ────────────────────────────────────────
 // Return the current FSM state + metadata for a learner (by ID or phone).
@@ -23,8 +56,8 @@ adminRouter.get('/learners/:id/state', async (req: Request, res: Response) => {
 
     // Accept phone number or UUID
     const learner = id.match(/^\d+$/)
-      ? await db.learners.findByPhone(id)
-      : await db.learners.findById(id);
+      ? await db.learners.findByPhone(id, req.auth!.organizationId)
+      : await db.learners.findById(id, req.auth!.organizationId);
 
     if (!learner) {
       res.status(404).json({ success: false, error: 'Learner not found' });
@@ -59,8 +92,8 @@ adminRouter.post('/learners/:id/reset', async (req: Request, res: Response) => {
     const { deleteHistory = false } = req.body as { deleteHistory?: boolean };
 
     const learner = id.match(/^\d+$/)
-      ? await db.learners.findByPhone(id)
-      : await db.learners.findById(id);
+      ? await db.learners.findByPhone(id, req.auth!.organizationId)
+      : await db.learners.findById(id, req.auth!.organizationId);
 
     if (!learner) {
       res.status(404).json({ success: false, error: 'Learner not found' });
@@ -120,8 +153,8 @@ adminRouter.post('/learners/:id/send', async (req: Request, res: Response) => {
     }
 
     const learner = id.match(/^\d+$/)
-      ? await db.learners.findByPhone(id)
-      : await db.learners.findById(id);
+      ? await db.learners.findByPhone(id, req.auth!.organizationId)
+      : await db.learners.findById(id, req.auth!.organizationId);
 
     if (!learner) {
       res.status(404).json({ success: false, error: 'Learner not found' });
@@ -144,7 +177,7 @@ adminRouter.post('/learners/:id/send', async (req: Request, res: Response) => {
 // bypassing Twilio signature validation. Useful for manual testing and CI.
 // Body: { phone: string, text?: string, buttonPayload?: string, profileName?: string }
 
-adminRouter.post('/simulate', async (req: Request, res: Response) => {
+adminRouter.post('/simulate', requireRole('super_admin'), async (req: Request, res: Response) => {
   try {
     const { phone, text, buttonPayload, profileName = 'Simulated User' } = req.body;
 

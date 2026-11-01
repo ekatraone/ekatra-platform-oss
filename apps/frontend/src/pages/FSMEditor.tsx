@@ -29,38 +29,78 @@ import { Plus, Save, GitBranch, ChevronLeft, ChevronRight, Users } from 'lucide-
 
 // ── Node colour map ───────────────────────────────────────────────────────────
 const NODE_COLORS: Record<FSMState['type'], string> = {
-  start: '#22c55e',   // green
-  lesson: '#3b82f6',  // blue
+  start: '#22c55e',    // green
+  lesson: '#3b82f6',   // blue
   question: '#f59e0b', // amber
-  end: '#ef4444',     // red
+  end: '#ef4444',      // red
+  // Authored-course node types (imported, view-only)
+  screen: '#0ea5e9',   // sky
+  choice: '#8b5cf6',   // violet
+  quiz: '#ec4899',     // pink
+  day_end: '#64748b',  // slate
 };
+
+const AUTHORED_TYPES: ReadonlySet<FSMState['type']> = new Set(['screen', 'choice', 'quiz', 'day_end']);
+
+/** Imported authored courses are view-only: the editor's save round-trip only keeps
+ * {id,type,label,data} and would silently strip text/options/media/triggers. */
+export function isAuthoredFsm(json: { states?: FSMState[]; startNodeId?: string } | undefined | null): boolean {
+  if (!json) return false;
+  return !!json.startNodeId || (json.states ?? []).some((s) => AUTHORED_TYPES.has(s.type));
+}
+
+function nodeLabel(s: FSMState): string {
+  if (s.label) return s.label;
+  const content = s.text || s.question || '';
+  const firstLine = content.split('\n').find((l) => l.trim()) ?? '';
+  const short = firstLine.replace(/[*_#]/g, '').trim().slice(0, 48);
+  return short || s.type.replace('_', ' ');
+}
 
 // ── Convert DB FSMJson ↔ React Flow nodes/edges ───────────────────────────────
 function toRFNodes(states: FSMState[]): Node[] {
-  return states.map((s, i) => ({
-    id: s.id,
-    type: 'default',
-    position: { x: 150 + (i % 4) * 220, y: 80 + Math.floor(i / 4) * 140 },
-    data: { label: s.label, nodeType: s.type, stateData: s.data },
-    style: {
-      background: NODE_COLORS[s.type],
-      color: '#fff',
-      borderRadius: 8,
-      border: '2px solid transparent',
-      width: 160,
-      fontSize: 13,
-      fontWeight: 600,
-    },
-  }));
+  // Authored graphs band rows by day so a 180-node course reads as a course, not a wall.
+  let lastDay: number | undefined;
+  let row = -1;
+  let col = 0;
+  return states.map((s, i) => {
+    let position;
+    if (s.day !== undefined) {
+      if (s.day !== lastDay || col >= 6) {
+        row += s.day !== lastDay ? 2 : 1; // blank band between days
+        col = 0;
+        lastDay = s.day;
+      }
+      position = { x: 150 + col * 230, y: 80 + row * 120 };
+      col++;
+    } else {
+      position = { x: 150 + (i % 4) * 220, y: 80 + Math.floor(i / 4) * 140 };
+    }
+    return {
+      id: s.id,
+      type: 'default',
+      position,
+      data: { label: nodeLabel(s), nodeType: s.type, stateData: s.data, authored: s },
+      style: {
+        background: NODE_COLORS[s.type] ?? '#6b7280',
+        color: '#fff',
+        borderRadius: 8,
+        border: s.mediaMissing ? '2px dashed #fbbf24' : '2px solid transparent',
+        width: 160,
+        fontSize: 13,
+        fontWeight: 600,
+      },
+    };
+  });
 }
 
 function toRFEdges(transitions: FSMTransition[]): Edge[] {
-  return transitions.map((t) => ({
-    id: t.id,
+  return transitions.map((t, i) => ({
+    id: t.id ?? `e_${t.from}__${t.to}__${i}`,
     source: t.from,
     target: t.to,
-    label: t.label ?? t.condition ?? '',
-    animated: t.condition === 'timeout',
+    label: t.trigger && t.trigger !== '__auto__' ? t.trigger : (t.label ?? t.condition ?? ''),
+    animated: t.condition === 'timeout' || t.trigger === '__auto__',
   }));
 }
 
@@ -93,9 +133,14 @@ export default function FSMEditor() {
   const [newFlowName, setNewFlowName] = useState('');
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Which definition the canvas currently holds (set in the same batch as its nodes/edges),
+  // and that definition's graph as last loaded or saved — autosave only writes real edits.
+  const [canvasDefId, setCanvasDefId] = useState<string | null>(null);
+  const loadedGraph = useRef<{ id: string; json: string } | null>(null);
 
   const [nodes, setNodes, onNodesChange] = useNodesState([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState([]);
+  const [inspectedNode, setInspectedNode] = useState<FSMState | null>(null);
 
   // List FSM definitions
   const { data: listData, isLoading: listLoading } = useQuery({
@@ -110,12 +155,24 @@ export default function FSMEditor() {
     enabled: !!selectedDefId,
   });
 
+  // Imported authored courses are view-only — saving would strip their content fields.
+  const readOnly = isAuthoredFsm(defData?.data?.fsm_json);
+  // Writes are allowed only once the selected flow has loaded onto the canvas. While another
+  // flow is loading (defData undefined, canvas still holding the previous flow) nothing saves.
+  const canWrite = !!selectedDefId && !defLoading && defData?.data?.id === selectedDefId
+    && canvasDefId === selectedDefId && !readOnly;
+
   // Populate canvas when definition loads
   useEffect(() => {
     if (!defData?.data) return;
-    const { fsm_json } = defData.data;
-    setNodes(toRFNodes(fsm_json.states ?? []));
-    setEdges(toRFEdges(fsm_json.transitions ?? []));
+    const { id, fsm_json } = defData.data;
+    const rfNodes = toRFNodes(fsm_json.states ?? []);
+    const rfEdges = toRFEdges(fsm_json.transitions ?? []);
+    loadedGraph.current = { id, json: JSON.stringify(toFsmJson(rfNodes, rfEdges)) };
+    setNodes(rfNodes);
+    setEdges(rfEdges);
+    setCanvasDefId(id);
+    setInspectedNode(null);
   }, [defData]);
 
   // Create new flow
@@ -123,17 +180,19 @@ export default function FSMEditor() {
     mutationFn: (name: string) => apiClient.createFsmDefinition({ name }),
     onSuccess: (res) => {
       qc.invalidateQueries({ queryKey: ['fsm-list'] });
-      setSelectedDefId(res.data.id);
+      selectDefinition(res.data.id);
       setNewFlowName('');
       toast({ title: 'Flow created', description: res.data.name });
     },
     onError: (e: Error) => toast({ title: 'Create failed', description: e.message, variant: 'destructive' }),
   });
 
-  // Save FSM (manual + auto)
+  // Save FSM (manual + auto). The target id is captured by the caller, never read from the
+  // current selection, so a pending save can't land on a flow selected in the meantime.
   const saveMutation = useMutation({
-    mutationFn: (json: FSMJson) => apiClient.updateFsmDefinition(selectedDefId!, { fsmJson: json }),
-    onSuccess: () => {
+    mutationFn: ({ id, json }: { id: string; json: FSMJson }) => apiClient.updateFsmDefinition(id, { fsmJson: json }),
+    onSuccess: (_res, { id, json }) => {
+      if (loadedGraph.current?.id === id) loadedGraph.current = { id, json: JSON.stringify(json) };
       qc.invalidateQueries({ queryKey: ['fsm-list'] });
       toast({ title: 'Saved', description: 'Flow saved.' });
     },
@@ -141,28 +200,41 @@ export default function FSMEditor() {
   });
 
   const handleSave = useCallback(() => {
-    if (!selectedDefId) return;
-    saveMutation.mutate(toFsmJson(nodes, edges));
-  }, [selectedDefId, nodes, edges]);
+    if (!canWrite) return;
+    saveMutation.mutate({ id: selectedDefId!, json: toFsmJson(nodes, edges) });
+  }, [canWrite, selectedDefId, nodes, edges]);
 
-  // Auto-save on canvas changes after 1.5s idle
+  // Auto-save graph edits after 1.5s idle — never for view-only authored courses, never for a
+  // flow that is still loading, and not for the canvas merely being populated from the server.
   useEffect(() => {
-    if (!selectedDefId || (nodes.length === 0 && edges.length === 0)) return;
+    if (!canWrite) return;
+    const id = selectedDefId!;
+    const json = toFsmJson(nodes, edges);
+    if (loadedGraph.current?.id === id && loadedGraph.current.json === JSON.stringify(json)) return;
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => {
-      saveMutation.mutate(toFsmJson(nodes, edges));
+      saveMutation.mutate({ id, json });
     }, 1500);
     return () => { if (saveTimer.current) clearTimeout(saveTimer.current); };
-  }, [nodes, edges]);
+  }, [nodes, edges, canWrite, selectedDefId]);
+
+  const selectDefinition = (id: string) => {
+    // Drop any pending autosave for the flow being left.
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    setSelectedDefId(id);
+  };
 
   const onConnect = useCallback(
-    (connection: Connection) => setEdges((eds) => addEdge({ ...connection, id: newNodeId() }, eds)),
-    [setEdges]
+    (connection: Connection) => {
+      if (!canWrite) return;
+      setEdges((eds) => addEdge({ ...connection, id: newNodeId() }, eds));
+    },
+    [setEdges, canWrite]
   );
 
-  const addNode = (type: FSMState['type']) => {
+  const addNode = (type: 'start' | 'lesson' | 'question' | 'end') => {
     const id = newNodeId();
-    const labels: Record<FSMState['type'], string> = { start: 'Start', lesson: 'Lesson', question: 'Question', end: 'End' };
+    const labels = { start: 'Start', lesson: 'Lesson', question: 'Question', end: 'End' };
     setNodes((nds) => [
       ...nds,
       {
@@ -242,7 +314,7 @@ export default function FSMEditor() {
                 {definitions.map((d) => (
                   <button
                     key={d.id}
-                    onClick={() => setSelectedDefId(d.id)}
+                    onClick={() => selectDefinition(d.id)}
                     className={`w-full text-left px-3 py-2 rounded text-sm transition-colors ${selectedDefId === d.id ? 'bg-primary text-primary-foreground' : 'hover:bg-muted'}`}
                   >
                     <div className="font-medium truncate">{d.name}</div>
@@ -263,23 +335,34 @@ export default function FSMEditor() {
               <>
                 {/* Toolbar */}
                 <div className="flex items-center gap-2 px-4 py-2 border-b bg-background">
-                  <span className="text-sm font-medium text-muted-foreground">Add node:</span>
-                  {(['start', 'lesson', 'question', 'end'] as FSMState['type'][]).map((type) => (
-                    <Badge
-                      key={type}
-                      className="cursor-pointer capitalize select-none hover:opacity-80 transition-opacity"
-                      style={{ background: NODE_COLORS[type], color: '#fff', border: 'none' }}
-                      onClick={() => addNode(type)}
-                    >
-                      + {type}
-                    </Badge>
-                  ))}
-                  <div className="ml-auto flex items-center gap-2">
-                    {saveMutation.isPending && <span className="text-xs text-muted-foreground">Saving…</span>}
-                    <Button size="sm" onClick={handleSave} disabled={saveMutation.isPending}>
-                      <Save className="h-3 w-3 mr-1" /> Save
-                    </Button>
-                  </div>
+                  {readOnly ? (
+                    <>
+                      <Badge variant="secondary" className="bg-amber-100 text-amber-800">View-only</Badge>
+                      <span className="text-sm text-muted-foreground">
+                        Imported authored course — content is managed by the importer, not this editor.
+                      </span>
+                    </>
+                  ) : (
+                    <>
+                      <span className="text-sm font-medium text-muted-foreground">Add node:</span>
+                      {(['start', 'lesson', 'question', 'end'] as const).map((type) => (
+                        <Badge
+                          key={type}
+                          className="cursor-pointer capitalize select-none hover:opacity-80 transition-opacity"
+                          style={{ background: NODE_COLORS[type], color: '#fff', border: 'none' }}
+                          onClick={() => addNode(type)}
+                        >
+                          + {type}
+                        </Badge>
+                      ))}
+                      <div className="ml-auto flex items-center gap-2">
+                        {saveMutation.isPending && <span className="text-xs text-muted-foreground">Saving…</span>}
+                        <Button size="sm" onClick={handleSave} disabled={saveMutation.isPending || !canWrite}>
+                          <Save className="h-3 w-3 mr-1" /> Save
+                        </Button>
+                      </div>
+                    </>
+                  )}
                 </div>
 
                 {/* React Flow canvas */}
@@ -295,6 +378,12 @@ export default function FSMEditor() {
                       onNodesChange={onNodesChange}
                       onEdgesChange={onEdgesChange}
                       onConnect={onConnect}
+                      onNodeClick={(_e, node) => {
+                        const authored = (node.data as { authored?: FSMState }).authored;
+                        setInspectedNode(authored ?? null);
+                      }}
+                      nodesDraggable={!readOnly}
+                      nodesConnectable={!readOnly}
                       fitView
                     >
                       <Background />
@@ -336,6 +425,49 @@ export default function FSMEditor() {
                             </Popover>
                           );
                         })}
+                      </div>
+                    )}
+                    {/* Node inspector — full content of a clicked authored node */}
+                    {inspectedNode && (
+                      <div className="absolute bottom-2 left-2 z-10 w-96 max-h-[60%] overflow-y-auto bg-background border rounded-lg shadow-lg p-3 text-sm">
+                        <div className="flex items-center justify-between mb-2">
+                          <div className="flex items-center gap-2">
+                            <Badge style={{ background: NODE_COLORS[inspectedNode.type] ?? '#6b7280', color: '#fff', border: 'none' }} className="capitalize">
+                              {inspectedNode.type.replace('_', ' ')}
+                            </Badge>
+                            {inspectedNode.day !== undefined && (
+                              <span className="text-xs text-muted-foreground">
+                                Day {inspectedNode.day}{inspectedNode.moduleNumber !== undefined ? ` · Module ${inspectedNode.moduleNumber}` : ''}
+                              </span>
+                            )}
+                          </div>
+                          <button onClick={() => setInspectedNode(null)} className="text-muted-foreground hover:text-foreground text-xs">✕</button>
+                        </div>
+                        {inspectedNode.text && (
+                          <p className="whitespace-pre-wrap text-xs leading-relaxed mb-2">{inspectedNode.text}</p>
+                        )}
+                        {inspectedNode.question && (
+                          <p className="font-medium text-xs mb-1">{inspectedNode.question}</p>
+                        )}
+                        {inspectedNode.options && inspectedNode.options.length > 0 && (
+                          <ul className="space-y-0.5 mb-2">
+                            {inspectedNode.options.map((o) => (
+                              <li key={o.id} className={`text-xs px-2 py-1 rounded ${o.correct ? 'bg-green-100 text-green-800 font-medium' : 'bg-muted'}`}>
+                                {o.label}{o.correct ? ' ✓' : ''}
+                              </li>
+                            ))}
+                          </ul>
+                        )}
+                        {inspectedNode.fileUrl && (
+                          <p className="text-xs text-muted-foreground">📎 {inspectedNode.fileName ?? inspectedNode.fileUrl}</p>
+                        )}
+                        {inspectedNode.mediaMissing && (
+                          <p className="text-xs text-amber-600">⚠️ Media missing (expired source URL): {inspectedNode.fileName ?? 'unnamed file'}</p>
+                        )}
+                        {inspectedNode.link && (
+                          <p className="text-xs text-muted-foreground truncate">🔗 {inspectedNode.link}</p>
+                        )}
+                        <p className="text-[10px] text-muted-foreground mt-2 font-mono">{inspectedNode.id}</p>
                       </div>
                     )}
                   </div>

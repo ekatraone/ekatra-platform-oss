@@ -5,6 +5,8 @@
  * Adapted from microlearn-main/src/services/whatsappService.ts
  */
 
+import { createHash } from 'node:crypto';
+
 // ── Pre-approved Twilio Content SIDs (work outside the 24hr session window) ──
 export const TWILIO_TEMPLATES = {
   daily_reminder:       'HX3097cf97f11eae20a76ee987c9bf0cff',  // vars: {1: name, 2: day, 3: course}
@@ -98,6 +100,8 @@ export interface SendResult {
   success: boolean;
   messageId?: string;
   error?: string;
+  /** The recipient can never be reached (no channel). Callers must not retry, queue or alert on it. */
+  permanent?: boolean;
 }
 
 class CloudAPIProvider {
@@ -502,6 +506,17 @@ class WATIProvider {
 // Avoids creating a new template on every message (matches original WhatsApp project behaviour)
 const _quickReplyCache = new Map<string, string>();
 
+/**
+ * Cache key for a quick-reply template: a hash of the FULL body plus every button's id and title.
+ * The template stores the body text, so any difference in it must miss the cache. (A body prefix
+ * used to be the key, which made every learning-plan card reuse the first one sent: stale topic,
+ * goal and style.)
+ */
+export function quickReplyCacheKey(message: { body: string; buttons: Array<{ id: string; title: string }> }): string {
+  const parts = [message.body, ...message.buttons.slice(0, 3).map((b) => `${b.id}\u0000${b.title}`)];
+  return 'qr2:' + createHash('sha256').update(parts.join('\u0001')).digest('hex');
+}
+
 class TwilioProvider {
   private accountSid: string;
   private authToken: string;
@@ -528,13 +543,15 @@ class TwilioProvider {
     return `whatsapp:${e164}`;
   }
 
-  private async send(to: string, body: string): Promise<SendResult> {
+  private async send(to: string, body: string, mediaUrl?: string): Promise<SendResult> {
     try {
       const params = new URLSearchParams({
         From: this.from,
         To: this.formatTo(to),
-        Body: body,
       });
+      // Twilio needs a Body or a MediaUrl; an image may go out without a caption.
+      if (body) params.set('Body', body);
+      if (mediaUrl) params.set('MediaUrl', mediaUrl);
       if (this.statusCallbackUrl) {
         params.set('StatusCallback', this.statusCallbackUrl);
       }
@@ -559,8 +576,8 @@ class TwilioProvider {
   }
 
   async sendImage(to: string, message: ImageMessage): Promise<SendResult> {
-    const body = message.caption ? `${message.caption}\n${message.imageUrl}` : message.imageUrl;
-    return this.send(to, body);
+    // Sent as real media (MediaUrl), not a link in the text body.
+    return this.send(to, message.caption || '', message.imageUrl);
   }
 
   async sendVideo(to: string, message: VideoMessage): Promise<SendResult> {
@@ -573,8 +590,8 @@ class TwilioProvider {
   }
 
   async sendDocument(to: string, message: DocumentMessage): Promise<SendResult> {
-    const body = message.caption ? `${message.caption}\n${message.documentUrl}` : message.documentUrl;
-    return this.send(to, body);
+    // Sent as a real attachment (MediaUrl), not a link in the text body.
+    return this.send(to, message.caption || '', message.documentUrl);
   }
 
   /**
@@ -591,8 +608,7 @@ class TwilioProvider {
         id: btn.id,
       }));
 
-      // Cache key: body prefix + sorted button titles (matches original ekatra-whatsapp caching)
-      const cacheKey = message.body.substring(0, 40) + '|' + message.buttons.map(b => b.title).sort().join('|');
+      const cacheKey = quickReplyCacheKey(message);
       let sid = _quickReplyCache.get(cacheKey);
 
       if (!sid) {
@@ -932,8 +948,62 @@ export function isTelegramRecipient(to: string): boolean {
   return to.startsWith('tg:');
 }
 
+// ── Public media URLs ──────────────────────────────────────────────────────
+// Generated lesson images are stored as a relative path and made absolute when a bundle or a
+// WhatsApp message is built, so a changed base URL never leaves stale links in the database.
+
+const MEDIA_PATH_RE = /^\/api\/sync\/media\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** True for exactly `/api/sync/media/<uuid>`; anything else stored in the database is ignored. */
+export function isMediaPath(value: unknown): value is string {
+  return typeof value === 'string' && MEDIA_PATH_RE.test(value);
+}
+
+/** The media id inside a stored path, or null when the value isn't that exact shape. */
+export function mediaIdFromPath(value: unknown): string | null {
+  return isMediaPath(value) ? value.slice(value.lastIndexOf('/') + 1).toLowerCase() : null;
+}
+
+/**
+ * Origin for public media links: PUBLIC_BASE_URL, else WEBHOOK_BASE_URL. Production needs an
+ * https origin; elsewhere an unset base falls back to localhost for local runs.
+ */
+export function publicBaseUrl(env: Record<string, string | undefined> = process.env): string | null {
+  const configured = (env.PUBLIC_BASE_URL || env.WEBHOOK_BASE_URL || '').trim();
+  if (!configured) return env.NODE_ENV === 'production' ? null : `http://localhost:${env.PORT || 3001}`;
+  let url: URL;
+  try {
+    url = new URL(configured);
+  } catch {
+    return null; // not a URL (e.g. no scheme): better no links than wrong ones
+  }
+  if (url.protocol !== 'https:' && !(url.protocol === 'http:' && env.NODE_ENV !== 'production')) return null;
+  // Origin only: a path, query or credentials on the configured value must never leak into media links.
+  return url.origin;
+}
+
+/** Absolute URL for a stored media path, or null when the value is junk or no base is configured. */
+export function absoluteMediaUrl(stored: unknown, env: Record<string, string | undefined> = process.env): string | null {
+  if (!isMediaPath(stored)) return null;
+  const base = publicBaseUrl(env);
+  return base ? `${base}${stored}` : null;
+}
+
+/**
+ * Learners who signed in only through the app (Google/email via Firebase) are addressed
+ * "fb:<uid>". They have no messaging channel: nothing may be sent to them, and above all not
+ * to a phone number derived from the uid (the Twilio formatter would strip it to digits).
+ */
+export function isAppOnlyRecipient(to: string): boolean {
+  return to.startsWith('fb:');
+}
+
+const NO_CHANNEL: SendResult = { success: false, permanent: true, error: 'recipient has no messaging channel (app-only learner)' };
+const appOnlyProvider = new Proxy({}, { get: () => async () => NO_CHANNEL }) as unknown as MockProvider;
+
 function providerFor(to: string): CloudAPIProvider | WATIProvider | TwilioProvider | MockProvider | TelegramProvider {
   if (!messagingInstance) throw new Error('Messaging not initialized');
+  if (isAppOnlyRecipient(to)) return appOnlyProvider;
   if (isTelegramRecipient(to)) {
     if (!telegramInstance) throw new Error('Telegram not initialized — set TELEGRAM_BOT_TOKEN');
     return telegramInstance;
@@ -1036,6 +1106,7 @@ export const messaging = {
    */
   async sendTemplate(to: string, sid: string, vars: Record<string, string> = {}): Promise<SendResult> {
     if (!messagingInstance) throw new Error('Messaging not initialized');
+    if (isAppOnlyRecipient(to)) return NO_CHANNEL;
     let result: SendResult;
     if (messagingInstance instanceof TwilioProvider) {
       result = await messagingInstance.sendTemplate(to, sid, vars);

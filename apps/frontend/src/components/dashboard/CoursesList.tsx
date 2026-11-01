@@ -160,7 +160,12 @@ const CoursesList = ({ courses }: CoursesListProps) => {
             {filteredCourses.length > 0 ? (
               filteredCourses.map((course) => (
                 <TableRow key={course.id}>
-                  <TableCell className="font-medium">{course.title}</TableCell>
+                  <TableCell className="font-medium">
+                    {course.title}
+                    {(course as any).source === 'authored' && (
+                      <Badge variant="outline" className="ml-2 text-violet-700 border-violet-300">authored</Badge>
+                    )}
+                  </TableCell>
                   <TableCell>{course.enrolled}</TableCell>
                   <TableCell>{course.completion}%</TableCell>
                   <TableCell>

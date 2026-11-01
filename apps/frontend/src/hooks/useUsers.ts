@@ -29,7 +29,10 @@ export const useUsers = () => {
     setLoading(true);
     try {
       const usersList = await fetchUsersList();
-      setUsers(usersList);
+      setUsers(usersList.map(user => ({
+        ...user, name: user.name || user.email.split('@')[0],
+        courses: 0, joined: user.created_at?.split('T')[0] || '', status: 'active',
+      })));
       setAdminRequired(false); // Reset admin required flag if successful
     } catch (error) {
       handleServiceError("fetching users", error);
@@ -58,7 +61,7 @@ export const useUsers = () => {
     }
   };
 
-  const updateUser = async (userId: number, updates: Partial<UserValidation>) => {
+  const updateUser = async (userId: string, updates: Partial<UserValidation>) => {
     try {
       await updateUserProfile(userId, updates);
       toast({
@@ -82,7 +85,7 @@ export const useUsers = () => {
     }
   };
 
-  const deleteUser = async (userId: number) => {
+  const deleteUser = async (userId: string) => {
     try {
       await deleteUserAccount(userId);
       toast({

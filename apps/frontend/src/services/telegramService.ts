@@ -13,23 +13,27 @@ export const getTelegramAnalytics = async () => {
   }
 };
 
-export const sendTelegramMessage = async (chatId: string, message: string) => {
+// Addressed by learner id (not Telegram chat id): /api/learners/:id/send-message looks the learner up by id.
+export const sendTelegramMessage = async (learnerId: string, message: string) => {
   try {
-    return await api.sendMessage(chatId, { type: 'text', content: message });
+    return await api.sendMessage(learnerId, { type: 'text', content: message });
   } catch (error) {
     console.error("Error sending Telegram message:", error);
     throw error;
   }
 };
 
-export const fetchTelegramUpdates = async () => {
-  // Get recent Telegram updates/messages
-  try {
-    return await api.getAnalytics();
-  } catch (error) {
-    console.error("Error fetching Telegram updates:", error);
-    return [];
-  }
+export const fetchTelegramUpdates = async (chatId?: string) => {
+  if (!chatId) return [];
+  const { data } = await api.getChatHistory(`tg:${chatId}`);
+  return data.map(row => ({
+    update_id: row.id,
+    message: {
+      chat: { id: chatId }, text: row.content || '',
+      date: new Date(row.created_at).getTime() / 1000,
+      from: { is_bot: row.direction === 'outbound' },
+    },
+  }));
 };
 
 export const telegramService = {

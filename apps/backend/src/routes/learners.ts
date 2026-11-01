@@ -20,14 +20,15 @@ export const learnersRouter: Router = Router();
 learnersRouter.get('/', async (req: Request, res: Response) => {
   try {
     const db = await getDb();
-    const { organizationId, status, search, page = 1, limit = 50 } = req.query;
+    const { status, search, page = 1, limit = 50 } = req.query;
 
     const learners = await db.learners.findAll({
-      organizationId: organizationId as string,
+      organizationId: req.auth!.organizationId,
       status: status as string,
       search: search as string,
-      page: Number(page),
-      limit: Number(limit)
+      page: Math.max(1, Number(page) || 1),
+      // Clamp: the value goes straight into SQL LIMIT; clients page for more (max 100 rows/page).
+      limit: Math.min(100, Math.max(1, Number(limit) || 50))
     });
 
     res.json({
@@ -42,6 +43,30 @@ learnersRouter.get('/', async (req: Request, res: Response) => {
 });
 
 /**
+ * GET /api/learners/:id/profile
+ * Derived learning profile (M13a): mastery, struggles, preferred hours, velocity.
+ * Recomputed from learner_events on read; admin-authed like every learners route.
+ */
+learnersRouter.get('/:id/profile', async (req: Request, res: Response) => {
+  try {
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(req.params.id)) {
+      return res.status(404).json({ success: false, error: 'Learner not found' });
+    }
+    const db = await getDb();
+    const learner = await db.learners.findById(req.params.id);
+    if (!learner || learner.organization_id !== req.auth!.organizationId) {
+      return res.status(404).json({ success: false, error: 'Learner not found' });
+    }
+    const { getLearnerProfile } = await import('../services/learnerProfile.js');
+    const profile = await getLearnerProfile(learner.id, learner.timezone);
+    res.json({ success: true, data: profile });
+  } catch (error) {
+    logger.error('Error computing learner profile:', error);
+    res.status(500).json({ success: false, error: 'Failed to compute learner profile' });
+  }
+});
+
+/**
  * GET /api/learners/by-phone/:phone/messages
  * Get message history for a learner looked up by phone number
  * (must be before /:id to avoid param capture)
@@ -52,7 +77,7 @@ learnersRouter.get('/by-phone/:phone/messages', async (req: Request, res: Respon
     const { phone } = req.params;
     const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 50));
 
-    const learner = await db.learners.findByPhone(phone);
+    const learner = await db.learners.findByPhone(phone, req.auth!.organizationId);
     if (!learner) {
       return res.status(404).json({ success: false, error: 'Learner not found' });
     }
@@ -83,7 +108,7 @@ learnersRouter.post('/bulk-enroll', async (req: Request, res: Response) => {
     }
 
     const course = await db.courses.findById(courseId);
-    if (!course) {
+    if (!course || course.organization_id !== req.auth!.organizationId) {
       return res.status(404).json({ success: false, error: 'Course not found' });
     }
 
@@ -94,11 +119,10 @@ learnersRouter.post('/bulk-enroll', async (req: Request, res: Response) => {
 
     for (const waId of waIds) {
       try {
-        let learner = await db.learners.findByPhone(waId);
+        let learner = await db.learners.findByPhone(waId, req.auth!.organizationId);
         if (!learner) {
-          const org = await db.organizations.getDefault();
           learner = await db.learners.create({
-            organizationId: org?.id,
+            organizationId: req.auth!.organizationId,
             phone: waId,
             whatsappId: waId,
             language: 'en',
@@ -148,7 +172,7 @@ learnersRouter.get('/:id', async (req: Request, res: Response) => {
     const db = await getDb();
     const { id } = req.params;
 
-    const learner = await db.learners.findById(id);
+    const learner = await db.learners.findById(id, req.auth!.organizationId);
     if (!learner) {
       return res.status(404).json({ success: false, error: 'Learner not found' });
     }
@@ -180,7 +204,7 @@ learnersRouter.get('/:id', async (req: Request, res: Response) => {
 learnersRouter.post('/', async (req: Request, res: Response) => {
   try {
     const db = await getDb();
-    const { organizationId, phone, name, email, whatsappId, language } = req.body;
+    const { phone, name, email, whatsappId, language } = req.body;
 
     if (!phone) {
       return res.status(400).json({ 
@@ -189,12 +213,7 @@ learnersRouter.post('/', async (req: Request, res: Response) => {
       });
     }
 
-    // Get default organization if not provided
-    let orgId = organizationId;
-    if (!orgId) {
-      const org = await db.organizations.getDefault();
-      orgId = org?.id;
-    }
+    const orgId = req.auth!.organizationId;
 
     // Check if already exists
     let learner = await db.learners.findByPhone(phone, orgId);
@@ -234,6 +253,11 @@ learnersRouter.put('/:id', async (req: Request, res: Response) => {
     const { id } = req.params;
     const { name, email, timezone, language, status, metadata } = req.body;
 
+    const existing = await db.learners.findById(id, req.auth!.organizationId);
+    if (!existing) {
+      return res.status(404).json({ success: false, error: 'Learner not found' });
+    }
+
     const learner = await db.learners.update(id, {
       name,
       email,
@@ -271,13 +295,13 @@ learnersRouter.post('/:id/enroll', async (req: Request, res: Response) => {
       return res.status(400).json({ success: false, error: 'Course ID is required' });
     }
 
-    const learner = await db.learners.findById(id);
+    const learner = await db.learners.findById(id, req.auth!.organizationId);
     if (!learner) {
       return res.status(404).json({ success: false, error: 'Learner not found' });
     }
 
     const course = await db.courses.findById(courseId);
-    if (!course) {
+    if (!course || course.organization_id !== req.auth!.organizationId) {
       return res.status(404).json({ success: false, error: 'Course not found' });
     }
 
@@ -346,7 +370,7 @@ learnersRouter.post('/:id/unenroll', async (req: Request, res: Response) => {
     const db = await getDb();
     const { id } = req.params;
 
-    const learner = await db.learners.findById(id);
+    const learner = await db.learners.findById(id, req.auth!.organizationId);
     if (!learner) {
       return res.status(404).json({ success: false, error: 'Learner not found' });
     }
@@ -376,6 +400,9 @@ learnersRouter.get('/:id/enrollments', async (req: Request, res: Response) => {
     const db = await getDb();
     const { id } = req.params;
 
+    const learner = await db.learners.findById(id, req.auth!.organizationId);
+    if (!learner) return res.status(404).json({ success: false, error: 'Learner not found' });
+
     const enrollments = await db.enrollments.findByLearner(id);
     res.json({ success: true, data: enrollments });
   } catch (error) {
@@ -392,6 +419,9 @@ learnersRouter.get('/:id/progress', async (req: Request, res: Response) => {
   try {
     const db = await getDb();
     const { id } = req.params;
+
+    const learner = await db.learners.findById(id, req.auth!.organizationId);
+    if (!learner) return res.status(404).json({ success: false, error: 'Learner not found' });
 
     const enrollments = await db.enrollments.findByLearner(id);
     const progressByEnrollment = await Promise.all(
@@ -415,7 +445,14 @@ learnersRouter.get('/:id/progress', async (req: Request, res: Response) => {
 learnersRouter.get('/:id/progress/:enrollmentId', async (req: Request, res: Response) => {
   try {
     const db = await getDb();
-    const { enrollmentId } = req.params;
+    const { id, enrollmentId } = req.params;
+
+    const learner = await db.learners.findById(id, req.auth!.organizationId);
+    if (!learner) return res.status(404).json({ success: false, error: 'Learner not found' });
+    const enrollments = await db.enrollments.findByLearner(id);
+    if (!enrollments.some((enrollment: any) => enrollment.id === enrollmentId)) {
+      return res.status(404).json({ success: false, error: 'Enrollment not found' });
+    }
 
     const progress = await db.lessonProgress.findByEnrollment(enrollmentId);
     res.json({ success: true, data: progress });
@@ -441,7 +478,7 @@ learnersRouter.post('/:id/send-message', async (req: Request, res: Response) => 
       return res.status(400).json({ success: false, error: 'Message is required' });
     }
 
-    const learner = await db.learners.findById(id);
+    const learner = await db.learners.findById(id, req.auth!.organizationId);
     if (!learner) {
       return res.status(404).json({ success: false, error: 'Learner not found' });
     }
@@ -450,8 +487,13 @@ learnersRouter.post('/:id/send-message', async (req: Request, res: Response) => 
       return res.status(400).json({ success: false, error: 'Learner has no phone number' });
     }
 
-    await messaging.sendText(learner.phone, { text: message });
-    
+    // Providers report failures in the result rather than throwing — surface them to the admin.
+    const result = await messaging.sendText(learner.phone, { text: message });
+    if (!result.success) {
+      logger.warn(`Message to learner ${id} not delivered: ${result.error}`);
+      return res.status(502).json({ success: false, error: `Message not delivered: ${result.error || 'provider rejected the send'}` });
+    }
+
     // Log the message
     await db.messageLog.create({
       learnerId: id,
@@ -479,6 +521,9 @@ learnersRouter.get('/:id/messages', async (req: Request, res: Response) => {
     const { id } = req.params;
     const { limit = 50 } = req.query;
 
+    const learner = await db.learners.findById(id, req.auth!.organizationId);
+    if (!learner) return res.status(404).json({ success: false, error: 'Learner not found' });
+
     const messages = await db.messageLog.findByLearner(id, Number(limit));
     res.json({ success: true, data: messages });
   } catch (error) {
@@ -494,9 +539,7 @@ learnersRouter.get('/:id/messages', async (req: Request, res: Response) => {
 learnersRouter.get('/stats/overview', async (req: Request, res: Response) => {
   try {
     const db = await getDb();
-    const { organizationId } = req.query;
-
-    const stats = await db.learners.getStats(organizationId as string);
+    const stats = await db.learners.getStats(req.auth!.organizationId);
     res.json({ success: true, data: stats });
   } catch (error) {
     logger.error('Error fetching learner stats:', error);

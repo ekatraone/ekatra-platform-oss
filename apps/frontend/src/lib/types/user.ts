@@ -1,6 +1,6 @@
 // User types for the application
 
-export type UserRole = 'admin' | 'instructor' | 'learner';
+export type UserRole = 'super_admin' | 'admin' | 'viewer';
 
 export interface UserValidation {
   name: string;
@@ -36,7 +36,7 @@ export interface AuthUser {
 
 // Define an AppUser interface for the UI representation
 export interface AppUser {
-  id: number;
+  id: string;
   name: string;
   email: string;
   role: string;

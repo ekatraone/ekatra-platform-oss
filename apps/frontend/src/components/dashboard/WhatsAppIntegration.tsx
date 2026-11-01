@@ -11,7 +11,6 @@ import { MessageCircle, Send, Code, Plus, Save, Check, Loader2 } from "lucide-re
 import { WhatsAppTemplate } from "@/lib/types";
 import { useToast } from "@/components/ui/use-toast";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { sendTestMessage } from "@/services/whatsappService";
 
 interface WhatsAppIntegrationProps {
   templates?: WhatsAppTemplate[];
@@ -73,7 +72,7 @@ const WhatsAppIntegration = ({
 
     try {
       setSending(true);
-      await sendTestMessage(recipient, selectedTemplate, parameters);
+      throw new Error('Template test sends are not supported by this interface yet.');
       toast({
         title: "Message sent",
         description: "Test message has been sent successfully!"
@@ -102,7 +101,7 @@ const WhatsAppIntegration = ({
           <CardContent className="space-y-4">
             <div className="flex items-center gap-2 p-4 bg-emerald-50 text-emerald-700 rounded-md">
               <Check className="h-5 w-5" />
-              <p>Your WhatsApp Business API is connected and active</p>
+              <p>{isConfigured ? 'WhatsApp configuration is available. Delivery must be verified with a test learner.' : 'WhatsApp connection has not been verified.'}</p>
             </div>
             
             <div className="space-y-2">
@@ -357,7 +356,8 @@ const WhatsAppIntegration = ({
               <Button 
                 className="w-full sm:w-auto" 
                 onClick={handleSendTest}
-                disabled={sending}
+                disabled
+                title="Template test sends are not supported by this interface yet."
               >
                 {sending ? (
                   <>

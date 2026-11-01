@@ -5,14 +5,14 @@ const getDb = () => import('@ekatra/database').then(m => m.db);
 
 export const analyticsRouter: Router = Router();
 
-analyticsRouter.get('/stats', async (_req: Request, res: Response) => {
+analyticsRouter.get('/stats', async (req: Request, res: Response) => {
   try {
     const db = await getDb();
     const [learnerStats, courseStats, messageStats, enrollmentStats] = await Promise.all([
-      db.learners.getStats(),
-      db.courses.getStats(),
-      db.messageLog.getStats(),
-      db.enrollments.getStats(),
+      db.learners.getStats(req.auth!.organizationId),
+      db.courses.getStats(req.auth!.organizationId),
+      db.messageLog.getStats(req.auth!.organizationId),
+      db.enrollments.getStats(undefined, req.auth!.organizationId),
     ]);
 
     const totalEnrollments = Number(enrollmentStats.total || 0);
@@ -39,10 +39,10 @@ analyticsRouter.get('/analytics', async (req: Request, res: Response) => {
     const days = Math.max(7, Math.min(90, Number(req.query.days || 30)));
 
     const [dailyMessages, dailyRegistrations, deliveryStats, completionBreakdown] = await Promise.all([
-      db.messageLog.getDailyVolume(days),
-      db.learners.getDailyRegistrations(days),
-      db.messageLog.getDeliveryStats(),
-      db.enrollments.getCompletionBreakdown(),
+      db.messageLog.getDailyVolume(days, req.auth!.organizationId),
+      db.learners.getDailyRegistrations(days, req.auth!.organizationId),
+      db.messageLog.getDeliveryStats(req.auth!.organizationId),
+      db.enrollments.getCompletionBreakdown(req.auth!.organizationId),
     ]);
 
     const registrationsByLabel = new Map(
@@ -90,10 +90,10 @@ analyticsRouter.get('/analytics', async (req: Request, res: Response) => {
   }
 });
 
-analyticsRouter.get('/courses/stats', async (_req: Request, res: Response) => {
+analyticsRouter.get('/courses/stats', async (req: Request, res: Response) => {
   try {
     const db = await getDb();
-    const data = await db.courses.getPerformanceStats();
+    const data = await db.courses.getPerformanceStats(req.auth!.organizationId);
 
     res.json({ success: true, data });
   } catch (error) {

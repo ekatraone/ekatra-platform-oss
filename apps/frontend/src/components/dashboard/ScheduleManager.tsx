@@ -35,9 +35,11 @@ import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import * as z from "zod";
 import { api } from "@/services/apiClient";
+import { fetchAllCourseRecords } from "@/lib/api";
 
 const scheduleFormSchema = z.object({
   courseId: z.string().min(1, "Course ID is required"),
+  name: z.string().trim().min(1, "Name is required"),
   time: z.string().regex(/^\d{2}:\d{2}$/, "Time must be in HH:MM format"),
   timezone: z.string().min(1, "Timezone is required"),
   days: z.array(z.number()).min(1, "Select at least one day"),
@@ -65,6 +67,7 @@ const ScheduleManager = () => {
     resolver: zodResolver(scheduleFormSchema),
     defaultValues: {
       courseId: "",
+      name: "",
       time: "09:00",
       timezone: "Asia/Kolkata",
       days: [1, 2, 3, 4, 5],
@@ -79,20 +82,23 @@ const ScheduleManager = () => {
 
   const schedules: any[] = Array.isArray(schedulesData) ? schedulesData : (schedulesData as any)?.data || [];
 
-  // Fetch courses for dropdown
+  // Fetch courses for dropdown. Own key: ['courses'] holds the mapped Course[] that
+  // Dashboard/Courses render, and this picker caches raw course records (every page).
   const { data: coursesData } = useQuery({
-    queryKey: ["courses"],
-    queryFn: () => api.getCourses({ limit: 100 }),
+    queryKey: ["courses", "schedule-picker"],
+    queryFn: () => fetchAllCourseRecords(),
   });
 
-  const courses: any[] = Array.isArray(coursesData) ? coursesData : (coursesData as any)?.data || (coursesData as any)?.courses || [];
+  const courses = coursesData ?? [];
 
   // Create schedule mutation
   const createScheduleMutation = useMutation({
     mutationFn: (data: ScheduleFormValues) =>
+      // Field names match POST /api/schedules (name and sendTime are what the route reads).
       api.createSchedule({
         courseId: data.courseId,
-        schedule: `${data.time} ${data.timezone}`,
+        name: data.name.trim(),
+        sendTime: data.time,
         timezone: data.timezone,
         daysOfWeek: data.days,
       }),
@@ -100,6 +106,7 @@ const ScheduleManager = () => {
       queryClient.invalidateQueries({ queryKey: ["schedules"] });
       setIsDialogOpen(false);
       form.reset();
+      setSelectedDays([1, 2, 3, 4, 5]);
       toast({
         title: "Success",
         description: "Schedule created successfully",
@@ -114,10 +121,10 @@ const ScheduleManager = () => {
     },
   });
 
-  // Update schedule mutation (pause/resume)
+  // Pause/resume via the dedicated routes (they flip is_active)
   const updateScheduleMutation = useMutation({
-    mutationFn: ({ id, isPaused }: { id: string; isPaused: boolean }) =>
-      api.updateSchedule(id, { isPaused }),
+    mutationFn: ({ id, pause }: { id: string; pause: boolean }) =>
+      pause ? api.pauseSchedule(id) : api.resumeSchedule(id),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ["schedules"] });
       toast({
@@ -156,8 +163,8 @@ const ScheduleManager = () => {
     createScheduleMutation.mutate(data);
   };
 
-  const toggleSchedule = (id: string, currentlyPaused: boolean) => {
-    updateScheduleMutation.mutate({ id, isPaused: !currentlyPaused });
+  const toggleSchedule = (id: string, currentlyActive: boolean) => {
+    updateScheduleMutation.mutate({ id, pause: currentlyActive });
   };
 
   const triggerManualPush = (scheduleId: string) => {
@@ -198,12 +205,26 @@ const ScheduleManager = () => {
                             className="w-full px-3 py-2 border rounded-md"
                           >
                             <option value="">Select a course</option>
-                            {courses.map((course: any) => (
+                            {courses.map((course) => (
                               <option key={course.id} value={course.id}>
                                 {course.title}
                               </option>
                             ))}
                           </select>
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+
+                  <FormField
+                    control={form.control}
+                    name="name"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>Name</FormLabel>
+                        <FormControl>
+                          <Input {...field} placeholder="Morning lesson" />
                         </FormControl>
                         <FormMessage />
                       </FormItem>
@@ -292,33 +313,43 @@ const ScheduleManager = () => {
                 <TableHead>Course</TableHead>
                 <TableHead>Schedule</TableHead>
                 <TableHead>Status</TableHead>
-                <TableHead>Next Run</TableHead>
+                <TableHead>Days</TableHead>
                 <TableHead>Actions</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
               {schedules.map((schedule: any) => (
                 <TableRow key={schedule.id}>
-                  <TableCell>{schedule.courseTitle || schedule.courseId}</TableCell>
-                  <TableCell>{schedule.schedule}</TableCell>
+                  {/* Rows come back snake_case from the schedules table (+ course_title) */}
                   <TableCell>
-                    <Badge variant={schedule.isPaused ? "secondary" : "default"}>
-                      {schedule.isPaused ? "Paused" : "Active"}
+                    <div>{schedule.course_title || schedule.course_id}</div>
+                    {schedule.name && <div className="text-xs text-muted-foreground">{schedule.name}</div>}
+                  </TableCell>
+                  <TableCell>
+                    {String(schedule.send_time ?? "").slice(0, 5)} {schedule.timezone}
+                  </TableCell>
+                  <TableCell>
+                    <Badge variant={schedule.is_active ? "default" : "secondary"}>
+                      {schedule.is_active ? "Active" : "Paused"}
                     </Badge>
                   </TableCell>
                   <TableCell>
-                    {schedule.nextRun
-                      ? new Date(schedule.nextRun).toLocaleString()
-                      : "N/A"}
+                    {Array.isArray(schedule.days_of_week)
+                      ? schedule.days_of_week
+                          .map((d: number) => WEEKDAYS.find((w) => w.value === Number(d) % 7)?.label.slice(0, 3) ?? d)
+                          .join(", ")
+                      : "—"}
                   </TableCell>
                   <TableCell>
                     <div className="flex gap-2">
                       <Button
                         size="sm"
                         variant="outline"
-                        onClick={() => toggleSchedule(schedule.id, schedule.isPaused)}
+                        onClick={() => toggleSchedule(schedule.id, !!schedule.is_active)}
+                        disabled={updateScheduleMutation.isPending}
+                        title={schedule.is_active ? "Pause" : "Resume"}
                       >
-                        {schedule.isPaused ? (
+                        {!schedule.is_active ? (
                           <Play className="h-4 w-4" />
                         ) : (
                           <Pause className="h-4 w-4" />

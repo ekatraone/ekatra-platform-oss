@@ -26,6 +26,13 @@ export function initializeDatabase(config?: {
       ? false
       : { rejectUnauthorized: true },
   });
+
+  // node-postgres emits 'error' on the pool when an idle client's connection
+  // drops (DB restart, failover, network blip). Without a listener that event
+  // throws and crashes the process; the pool discards the client and reconnects.
+  pool.on('error', err => {
+    console.error('Idle database client error:', err.message);
+  });
   
   // Test connection
   pool.query('SELECT 1').catch(err => {
@@ -181,8 +188,11 @@ const coursesRepo = {
     };
   },
 
-  async findById(id: string) {
-    const result = await query('SELECT * FROM courses WHERE id = $1', [id]);
+  async findById(id: string, organizationId?: string) {
+    const result = await query(
+      `SELECT * FROM courses WHERE id = $1${organizationId ? ' AND organization_id = $2' : ''}`,
+      organizationId ? [id, organizationId] : [id]
+    );
     return result.rows[0] || null;
   },
 
@@ -208,13 +218,15 @@ const coursesRepo = {
     status?: string;
     settings?: any;
     createdBy?: string;
+    source?: 'ai_generated' | 'authored';
   }) {
     const result = await query(
-      `INSERT INTO courses (organization_id, title, description, category, status, settings, created_by)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
+      `INSERT INTO courses (organization_id, title, description, category, status, settings, created_by, source)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        RETURNING *`,
-      [data.organizationId, data.title, data.description, data.category, 
-       data.status || 'draft', data.settings || {}, data.createdBy]
+      [data.organizationId, data.title, data.description, data.category,
+       data.status || 'draft', data.settings || {}, data.createdBy,
+       data.source || 'ai_generated']
     );
     return result.rows[0];
   },
@@ -226,7 +238,7 @@ const coursesRepo = {
     status: string;
     settings: any;
     fsm_definition_id: string | null;
-  }>) {
+  }>, organizationId?: string) {
     const sets: string[] = [];
     const params: any[] = [];
     let idx = 1;
@@ -240,15 +252,21 @@ const coursesRepo = {
     if (sets.length === 0) return null;
 
     params.push(id);
+    if (organizationId) params.push(organizationId);
     const result = await query(
-      `UPDATE courses SET ${sets.join(', ')}, updated_at = NOW() WHERE id = $${idx} RETURNING *`,
+      `UPDATE courses SET ${sets.join(', ')}, updated_at = NOW()
+       WHERE id = $${idx}${organizationId ? ` AND organization_id = $${idx + 1}` : ''}
+       RETURNING *`,
       params
     );
     return result.rows[0] || null;
   },
 
-  async delete(id: string) {
-    await query('DELETE FROM courses WHERE id = $1', [id]);
+  async delete(id: string, organizationId?: string) {
+    await query(
+      `DELETE FROM courses WHERE id = $1${organizationId ? ' AND organization_id = $2' : ''}`,
+      organizationId ? [id, organizationId] : [id]
+    );
   },
 
   async getStats(organizationId?: string) {
@@ -268,7 +286,7 @@ const coursesRepo = {
     return result.rows[0];
   },
 
-  async getPerformanceStats() {
+  async getPerformanceStats(organizationId?: string) {
     const result = await query(`
       SELECT
         c.id,
@@ -280,9 +298,10 @@ const coursesRepo = {
         )::int                                                                     AS completion_pct
       FROM courses c
       LEFT JOIN enrollments e ON e.course_id = c.id
+      ${organizationId ? 'WHERE c.organization_id = $1' : ''}
       GROUP BY c.id, c.title
       ORDER BY enrolled DESC
-    `);
+    `, organizationId ? [organizationId] : []);
     return result.rows;
   }
 };
@@ -341,7 +360,7 @@ const lessonsRepo = {
     durationMinutes: number;
     dayNumber: number;
     metadata: any;
-  }>) {
+  }>, courseId?: string) {
     const sets: string[] = [];
     const params: any[] = [];
     let idx = 1;
@@ -366,15 +385,21 @@ const lessonsRepo = {
     if (sets.length === 0) return null;
 
     params.push(id);
+    if (courseId) params.push(courseId);
     const result = await query(
-      `UPDATE lessons SET ${sets.join(', ')}, updated_at = NOW() WHERE id = $${idx} RETURNING *`,
+      `UPDATE lessons SET ${sets.join(', ')}, updated_at = NOW()
+       WHERE id = $${idx}${courseId ? ` AND course_id = $${idx + 1}` : ''}
+       RETURNING *`,
       params
     );
     return result.rows[0] || null;
   },
 
-  async delete(id: string) {
-    await query('DELETE FROM lessons WHERE id = $1', [id]);
+  async delete(id: string, courseId?: string) {
+    await query(
+      `DELETE FROM lessons WHERE id = $1${courseId ? ' AND course_id = $2' : ''}`,
+      courseId ? [id, courseId] : [id]
+    );
   },
 
   async countByCourse(courseId: string) {
@@ -427,8 +452,11 @@ const learnersRepo = {
     };
   },
 
-  async findById(id: string) {
-    const result = await query('SELECT * FROM learners WHERE id = $1', [id]);
+  async findById(id: string, organizationId?: string) {
+    const result = await query(
+      `SELECT * FROM learners WHERE id = $1${organizationId ? ' AND organization_id = $2' : ''}`,
+      organizationId ? [id, organizationId] : [id]
+    );
     return result.rows[0] || null;
   },
 
@@ -558,7 +586,7 @@ const learnersRepo = {
     return result.rows[0];
   },
 
-  async getDailyRegistrations(days = 30) {
+  async getDailyRegistrations(days = 30, organizationId?: string) {
     const result = await query(`
       SELECT
         gs.day::date AS label,
@@ -569,9 +597,10 @@ const learnersRepo = {
         '1 day'::interval
       ) AS gs(day)
       LEFT JOIN learners l ON l.created_at::date = gs.day::date
+        ${organizationId ? 'AND l.organization_id = $2' : ''}
       GROUP BY gs.day
       ORDER BY gs.day
-    `, [days]);
+    `, organizationId ? [days, organizationId] : [days]);
     return result.rows;
   }
 };
@@ -696,38 +725,45 @@ const enrollmentsRepo = {
     return result.rows;
   },
 
-  async getStats(courseId?: string) {
+  async getStats(courseId?: string, organizationId?: string) {
     let sql = `
       SELECT 
         COUNT(*) as total,
-        COUNT(*) FILTER (WHERE status = 'enrolled') as enrolled,
-        COUNT(*) FILTER (WHERE status = 'in_progress') as in_progress,
-        COUNT(*) FILTER (WHERE status = 'completed') as completed,
-        COUNT(*) FILTER (WHERE status = 'dropped') as dropped
-      FROM enrollments
+        COUNT(*) FILTER (WHERE e.status = 'enrolled') as enrolled,
+        COUNT(*) FILTER (WHERE e.status = 'in_progress') as in_progress,
+        COUNT(*) FILTER (WHERE e.status = 'completed') as completed,
+        COUNT(*) FILTER (WHERE e.status = 'dropped') as dropped
+      FROM enrollments e
+      JOIN courses c ON c.id = e.course_id
     `;
     const params: any[] = [];
     if (courseId) {
-      sql += ' WHERE course_id = $1';
+      sql += ' WHERE e.course_id = $1';
       params.push(courseId);
+    }
+    if (organizationId) {
+      sql += courseId ? ' AND c.organization_id = $2' : ' WHERE c.organization_id = $1';
+      params.push(organizationId);
     }
     const result2 = await query(sql, params);
     return result2.rows[0];
   },
 
-  async getCompletionBreakdown() {
+  async getCompletionBreakdown(organizationId?: string) {
     const result = await query(`
-      SELECT status, COUNT(*)::int AS count
-      FROM enrollments
-      GROUP BY status
-    `);
+      SELECT e.status, COUNT(*)::int AS count
+      FROM enrollments e
+      JOIN courses c ON c.id = e.course_id
+      ${organizationId ? 'WHERE c.organization_id = $1' : ''}
+      GROUP BY e.status
+    `, organizationId ? [organizationId] : []);
     return result.rows;
   }
 };
 
 // ============ SCHEDULES ============
 const schedulesRepo = {
-  async findAll(courseId?: string) {
+  async findAll(courseId?: string, organizationId?: string) {
     let sql = 'SELECT s.*, c.title as course_title FROM schedules s JOIN courses c ON s.course_id = c.id';
     const params: any[] = [];
     
@@ -735,19 +771,23 @@ const schedulesRepo = {
       sql += ' WHERE s.course_id = $1';
       params.push(courseId);
     }
+    if (organizationId) {
+      sql += courseId ? ' AND c.organization_id = $2' : ' WHERE c.organization_id = $1';
+      params.push(organizationId);
+    }
     sql += ' ORDER BY s.created_at DESC';
     
     const result = await query(sql, params);
     return result.rows;
   },
 
-  async findById(id: string) {
+  async findById(id: string, organizationId?: string) {
     const result = await query(
       `SELECT s.*, c.title as course_title 
        FROM schedules s 
        JOIN courses c ON s.course_id = c.id 
-       WHERE s.id = $1`,
-      [id]
+       WHERE s.id = $1${organizationId ? ' AND c.organization_id = $2' : ''}`,
+      organizationId ? [id, organizationId] : [id]
     );
     return result.rows[0] || null;
   },
@@ -777,7 +817,7 @@ const schedulesRepo = {
        RETURNING *`,
       [data.courseId, data.name, data.scheduleType || 'daily',
        data.daysOfWeek || [1,2,3,4,5], data.sendTime || '09:00',
-       data.timezone || 'UTC', data.isActive ?? true]
+       data.timezone || 'Asia/Kolkata', data.isActive ?? true]
     );
     return result.rows[0];
   },
@@ -789,7 +829,7 @@ const schedulesRepo = {
     sendTime: string;
     timezone: string;
     isActive: boolean;
-  }>) {
+  }>, organizationId?: string) {
     const sets: string[] = [];
     const params: any[] = [];
     let idx = 1;
@@ -812,15 +852,23 @@ const schedulesRepo = {
     if (sets.length === 0) return null;
 
     params.push(id);
+    if (organizationId) params.push(organizationId);
     const result = await query(
-      `UPDATE schedules SET ${sets.join(', ')}, updated_at = NOW() WHERE id = $${idx} RETURNING *`,
+      `UPDATE schedules SET ${sets.join(', ')}, updated_at = NOW()
+       WHERE id = $${idx}
+       ${organizationId ? `AND course_id IN (SELECT id FROM courses WHERE organization_id = $${idx + 1})` : ''}
+       RETURNING *`,
       params
     );
     return result.rows[0] || null;
   },
 
-  async delete(id: string) {
-    await query('DELETE FROM schedules WHERE id = $1', [id]);
+  async delete(id: string, organizationId?: string) {
+    await query(
+      `DELETE FROM schedules WHERE id = $1
+       ${organizationId ? 'AND course_id IN (SELECT id FROM courses WHERE organization_id = $2)' : ''}`,
+      organizationId ? [id, organizationId] : [id]
+    );
   }
 };
 
@@ -857,15 +905,17 @@ const messageLogRepo = {
     return result.rows[0];
   },
 
-  async getStats() {
+  async getStats(organizationId?: string) {
     const result = await query(`
       SELECT 
         COUNT(*) as total,
-        COUNT(*) FILTER (WHERE direction = 'inbound') as inbound,
-        COUNT(*) FILTER (WHERE direction = 'outbound') as outbound,
-        COUNT(*) FILTER (WHERE created_at > NOW() - INTERVAL '1 day') as today
-      FROM message_log
-    `);
+        COUNT(*) FILTER (WHERE ml.direction = 'inbound') as inbound,
+        COUNT(*) FILTER (WHERE ml.direction = 'outbound') as outbound,
+        COUNT(*) FILTER (WHERE ml.created_at > NOW() - INTERVAL '1 day') as today
+      FROM message_log ml
+      JOIN learners l ON l.id = ml.learner_id
+      ${organizationId ? 'WHERE l.organization_id = $1' : ''}
+    `, organizationId ? [organizationId] : []);
     return result.rows[0];
   },
 
@@ -895,9 +945,21 @@ const messageLogRepo = {
     if (extraMetadata) {
       Object.assign(metadataPatch, extraMetadata);
     }
+    // Callbacks arrive out of order (and failed receipts are replayed later), so
+    // only move status forward: queued < sending < sent < delivered < read.
+    // failed/undelivered always apply, but a late sent/delivered/read never
+    // overwrites them; unknown current statuses are overwritable. The metadata
+    // patch (timestamps, error codes) is merged either way.
     const result = await query(
       `UPDATE message_log
-       SET status = $2,
+       SET status = CASE
+             WHEN $2::text IN ('failed', 'undelivered') THEN $2::text
+             WHEN status IN ('failed', 'undelivered') THEN status
+             WHEN array_position(ARRAY['queued','sending','sent','delivered','read'], status::text) IS NULL THEN $2::text
+             WHEN array_position(ARRAY['queued','sending','sent','delivered','read'], $2::text)
+                  >= array_position(ARRAY['queued','sending','sent','delivered','read'], status::text) THEN $2::text
+             ELSE status
+           END,
            metadata = metadata || $3::jsonb
        WHERE whatsapp_message_id = $1
        RETURNING *`,
@@ -906,35 +968,186 @@ const messageLogRepo = {
     return result.rows[0] || null;
   },
 
-  async getDailyVolume(days = 30) {
+  async getDailyVolume(days = 30, organizationId?: string) {
     const result = await query(`
       SELECT
         gs.day::date AS label,
-        COUNT(ml.id) FILTER (WHERE ml.direction = 'outbound')::int AS outbound,
-        COUNT(ml.id) FILTER (WHERE ml.direction = 'inbound')::int  AS inbound
+        COUNT(ml.id) FILTER (WHERE ml.direction = 'outbound'${organizationId ? ' AND l.id IS NOT NULL' : ''})::int AS outbound,
+        COUNT(ml.id) FILTER (WHERE ml.direction = 'inbound'${organizationId ? ' AND l.id IS NOT NULL' : ''})::int  AS inbound
       FROM generate_series(
         NOW() - ($1 || ' days')::interval,
         NOW(),
         '1 day'::interval
       ) AS gs(day)
       LEFT JOIN message_log ml ON ml.created_at::date = gs.day::date
+      LEFT JOIN learners l ON l.id = ml.learner_id
+        ${organizationId ? 'AND l.organization_id = $2' : ''}
       GROUP BY gs.day
       ORDER BY gs.day
-    `, [days]);
+    `, organizationId ? [days, organizationId] : [days]);
     return result.rows;
   },
 
-  async getDeliveryStats() {
+  async getDeliveryStats(organizationId?: string) {
     const result = await query(`
       SELECT
-        COUNT(*) FILTER (WHERE direction = 'outbound')::int                   AS sent,
-        COUNT(*) FILTER (WHERE direction = 'outbound' AND status = 'delivered')::int AS delivered,
-        COUNT(*) FILTER (WHERE direction = 'outbound' AND status = 'read')::int      AS read,
-        COUNT(*) FILTER (WHERE direction = 'outbound' AND status = 'failed')::int    AS failed
-      FROM message_log
-    `);
+        COUNT(*) FILTER (WHERE ml.direction = 'outbound')::int                   AS sent,
+        COUNT(*) FILTER (WHERE ml.direction = 'outbound' AND ml.status = 'delivered')::int AS delivered,
+        COUNT(*) FILTER (WHERE ml.direction = 'outbound' AND ml.status = 'read')::int      AS read,
+        COUNT(*) FILTER (WHERE ml.direction = 'outbound' AND ml.status = 'failed')::int    AS failed
+      FROM message_log ml
+      JOIN learners l ON l.id = ml.learner_id
+      ${organizationId ? 'WHERE l.organization_id = $1' : ''}
+    `, organizationId ? [organizationId] : []);
     return result.rows[0];
   }
+};
+
+// ============ WEBHOOK RECEIPTS ============
+const webhookReceiptsRepo = {
+  async receiveAndClaim(data: {
+    provider: string;
+    externalEventId: string;
+    eventType: string;
+    payload: unknown;
+    leaseSeconds?: number;
+  }): Promise<{ id: string; claimed: boolean; status: string }> {
+    const leaseSeconds = Math.max(1, Math.min(data.leaseSeconds ?? 300, 3600));
+    const result = await query<{ id: string; status: string }>(
+      `INSERT INTO webhook_receipts (
+         provider, external_event_id, event_type, payload,
+         status, attempts, processing_started_at
+       )
+       VALUES ($1, $2, $3, $4::jsonb, 'processing', 1, NOW())
+       ON CONFLICT (provider, external_event_id, event_type) DO UPDATE
+       SET status = 'processing',
+           attempts = webhook_receipts.attempts + 1,
+           processing_started_at = NOW(),
+           updated_at = NOW(),
+           last_error = NULL
+       WHERE webhook_receipts.status IN ('received', 'failed')
+          OR (
+            webhook_receipts.status = 'processing'
+            AND webhook_receipts.processing_started_at < NOW() - ($5 * INTERVAL '1 second')
+          )
+       RETURNING id, status`,
+      [data.provider, data.externalEventId, data.eventType, JSON.stringify(data.payload), leaseSeconds]
+    );
+
+    if (result.rows[0]) return { ...result.rows[0], claimed: true };
+
+    const existing = await query<{ id: string; status: string }>(
+      `SELECT id, status FROM webhook_receipts
+       WHERE provider = $1 AND external_event_id = $2 AND event_type = $3`,
+      [data.provider, data.externalEventId, data.eventType]
+    );
+    if (!existing.rows[0]) throw new Error('Webhook receipt could not be persisted');
+    return { ...existing.rows[0], claimed: false };
+  },
+
+  async markProcessed(id: string): Promise<void> {
+    await query(
+      `UPDATE webhook_receipts
+       SET status = 'processed', processed_at = NOW(), updated_at = NOW(), last_error = NULL
+       WHERE id = $1`,
+      [id]
+    );
+  },
+
+  async markFailed(id: string, error: unknown): Promise<void> {
+    const message = error instanceof Error ? error.message : String(error);
+    await query(
+      `UPDATE webhook_receipts
+       SET status = 'failed', last_error = LEFT($2, 2000), updated_at = NOW()
+       WHERE id = $1`,
+      [id, message]
+    );
+  },
+
+  async claimRecoverable(options?: {
+    provider?: string;
+    limit?: number;
+    leaseSeconds?: number;
+    maxAttempts?: number;
+  }): Promise<Array<{
+    id: string;
+    provider: string;
+    external_event_id: string;
+    event_type: string;
+    payload: any;
+    attempts: number;
+  }>> {
+    const provider = options?.provider ?? 'cloudapi';
+    const limit = Math.max(1, Math.min(options?.limit ?? 25, 100));
+    const leaseSeconds = Math.max(1, Math.min(options?.leaseSeconds ?? 300, 3600));
+    const maxAttempts = Math.max(1, Math.min(options?.maxAttempts ?? 8, 100));
+    const result = await query(
+      `WITH candidates AS (
+         SELECT id
+         FROM webhook_receipts
+         WHERE provider = $1
+           AND attempts < $4
+           AND (
+             status = 'received'
+             OR (
+               status = 'failed'
+               AND updated_at < NOW() - (LEAST(POWER(2, attempts), 300) * INTERVAL '1 second')
+             )
+             OR (
+               status = 'processing'
+               AND processing_started_at < NOW() - ($3 * INTERVAL '1 second')
+             )
+           )
+         ORDER BY received_at
+         LIMIT $2
+         FOR UPDATE SKIP LOCKED
+       )
+       UPDATE webhook_receipts AS receipt
+       SET status = 'processing',
+           attempts = receipt.attempts + 1,
+           processing_started_at = NOW(),
+           updated_at = NOW(),
+           last_error = NULL
+       FROM candidates
+       WHERE receipt.id = candidates.id
+       RETURNING receipt.id, receipt.provider, receipt.external_event_id,
+                 receipt.event_type, receipt.payload, receipt.attempts`,
+      [provider, limit, leaseSeconds, maxAttempts]
+    );
+    return result.rows;
+  },
+
+  async findFailed(limit = 50) {
+    const boundedLimit = Math.max(1, Math.min(limit, 100));
+    const result = await query(
+      `SELECT id, provider, external_event_id, event_type, status, attempts,
+              last_error, received_at, updated_at, replay_requested_at,
+              replay_requested_by
+       FROM webhook_receipts
+       WHERE status = 'failed'
+       ORDER BY updated_at DESC
+       LIMIT $1`,
+      [boundedLimit]
+    );
+    return result.rows;
+  },
+
+  async requestReplay(id: string, requestedBy: string) {
+    const result = await query(
+      `UPDATE webhook_receipts
+       SET status = 'received',
+           attempts = 0,
+           processing_started_at = NULL,
+           replay_requested_at = NOW(),
+           replay_requested_by = $2,
+           updated_at = NOW()
+       WHERE id = $1 AND status = 'failed'
+       RETURNING id, provider, external_event_id, event_type, status,
+                 replay_requested_at, replay_requested_by`,
+      [id, requestedBy]
+    );
+    return result.rows[0] || null;
+  },
 };
 
 // ============ FAILED MESSAGES (Dead-Letter Queue) ============
@@ -1372,6 +1585,50 @@ const fsmDefinitionsRepo = {
   },
 };
 
+// ============ LEARNER EVENTS (M13a) ============
+const learnerEventsRepo = {
+  async create(data: {
+    learnerId: string;
+    courseId?: string | null;
+    nodeId?: string | null;
+    type: string;
+    payload?: any;
+  }) {
+    const result = await query(
+      `INSERT INTO learner_events (learner_id, course_id, node_id, type, payload)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING *`,
+      [data.learnerId, data.courseId ?? null, data.nodeId ?? null, data.type, data.payload ?? {}]
+    );
+    return result.rows[0];
+  },
+
+  async findByLearner(learnerId: string, limit: number = 1000) {
+    // Newest rows win the LIMIT (recency weighting needs the latest slice);
+    // id tiebreaker keeps equal-timestamp ordering deterministic.
+    // Returned oldest→newest, as computeProfile expects.
+    const result = await query(
+      `SELECT * FROM (
+         SELECT * FROM learner_events
+         WHERE learner_id = $1
+         ORDER BY created_at DESC, id DESC
+         LIMIT $2
+       ) latest
+       ORDER BY created_at ASC, id ASC`,
+      [learnerId, limit]
+    );
+    return result.rows;
+  },
+
+  async updateLearnerProfile(learnerId: string, profile: any) {
+    const result = await query(
+      `UPDATE learners SET profile = $1, updated_at = NOW() WHERE id = $2 RETURNING id`,
+      [JSON.stringify(profile), learnerId]
+    );
+    return result.rows[0] ?? null;
+  },
+};
+
 // ============ EXPORT ============
 export const db = {
   raw: query,
@@ -1383,6 +1640,7 @@ export const db = {
   enrollments: enrollmentsRepo,
   schedules: schedulesRepo,
   messageLog: messageLogRepo,
+  webhookReceipts: webhookReceiptsRepo,
   lessonProgress: lessonProgressRepo,
   quiz: quizRepo,
   embeddings: embeddingsRepo,
@@ -1391,6 +1649,7 @@ export const db = {
   contentApiCache: contentApiCacheRepo,
   failedMessages: failedMessagesRepo,
   fsmDefinitions: fsmDefinitionsRepo,
+  learnerEvents: learnerEventsRepo,
 };
 
 export default db;

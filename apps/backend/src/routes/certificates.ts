@@ -1,4 +1,5 @@
 import { Router, Request, Response } from 'express';
+import { matchesCertificateAccessToken } from '@ekatra/delivery/certificates';
 
 const getDb = () => import('@ekatra/database').then(m => m.db);
 
@@ -8,7 +9,8 @@ export const certificatesRouter: Router = Router();
  * GET /api/certificates/:learnerId
  *
  * Streams the learner's certificate PDF.
- * Public endpoint — no auth required (learner shares the URL via WhatsApp).
+ * Capability URL — the certificate link contains an unguessable token that is
+ * replaced when the certificate is regenerated.
  */
 certificatesRouter.get('/:learnerId', async (req: Request, res: Response) => {
   try {
@@ -21,8 +23,11 @@ certificatesRouter.get('/:learnerId', async (req: Request, res: Response) => {
     }
 
     const base64 = learner.metadata?.certificateBase64;
-    if (!base64) {
-      res.status(404).json({ error: 'Certificate not yet generated' });
+    const expectedToken = learner.metadata?.certificateAccessToken;
+    const suppliedToken = typeof req.query.token === 'string' ? req.query.token : '';
+    const tokenMatches = matchesCertificateAccessToken(suppliedToken, expectedToken);
+    if (!base64 || !tokenMatches) {
+      res.status(404).json({ error: 'Certificate not found' });
       return;
     }
 

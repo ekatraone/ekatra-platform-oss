@@ -6,6 +6,7 @@
 
 import { Router, Request, Response } from 'express';
 import { logger } from '../lib/logger.js';
+import { requireRole } from '../middleware/auth.js';
 
 // Lazy import to avoid circular dependencies
 const getDb = () => import('@ekatra/database').then(m => m.db);
@@ -19,14 +20,15 @@ export const coursesRouter: Router = Router();
 coursesRouter.get('/', async (req: Request, res: Response) => {
   try {
     const db = await getDb();
-    const { organizationId, status, search, page = 1, limit = 20 } = req.query;
+    const { status, search, page = 1, limit = 20 } = req.query;
     
     const courses = await db.courses.findAll({
-      organizationId: organizationId as string,
+      organizationId: req.auth!.organizationId,
       status: status as string,
       search: search as string,
-      page: Number(page),
-      limit: Number(limit)
+      page: Math.max(1, Number(page) || 1),
+      // Clamp: the value goes straight into SQL LIMIT; clients page for more (max 100 rows/page).
+      limit: Math.min(100, Math.max(1, Number(limit) || 20))
     });
 
     res.json({
@@ -49,7 +51,7 @@ coursesRouter.get('/:id', async (req: Request, res: Response) => {
     const db = await getDb();
     const { id } = req.params;
     
-    const course = await db.courses.findById(id);
+    const course = await db.courses.findById(id, req.auth!.organizationId);
     if (!course) {
       return res.status(404).json({ success: false, error: 'Course not found' });
     }
@@ -77,7 +79,7 @@ coursesRouter.get('/:id', async (req: Request, res: Response) => {
 coursesRouter.post('/', async (req: Request, res: Response) => {
   try {
     const db = await getDb();
-    const { organizationId, title, description, category, status, createdBy } = req.body;
+    const { title, description, category, status } = req.body;
 
     if (!title) {
       return res.status(400).json({ 
@@ -86,20 +88,13 @@ coursesRouter.post('/', async (req: Request, res: Response) => {
       });
     }
 
-    // Get default organization if not provided
-    let orgId = organizationId;
-    if (!orgId) {
-      const org = await db.organizations.getDefault();
-      orgId = org?.id;
-    }
-
     const course = await db.courses.create({
-      organizationId: orgId,
+      organizationId: req.auth!.organizationId,
       title,
       description,
       category,
       status: status || 'draft',
-      createdBy
+      createdBy: req.auth!.userId,
     });
 
     logger.info(`Course created: ${course.id}`);
@@ -116,10 +111,14 @@ coursesRouter.post('/', async (req: Request, res: Response) => {
  * capabilities) and send it with the lesson text to a learner address.
  * Body: { to } — e.g. "tg:<chat_id>" (Telegram) — media buffers are Telegram-only today.
  */
-coursesRouter.post('/lessons/:lessonId/send-media', async (req: Request, res: Response) => {
+coursesRouter.post('/lessons/:lessonId/send-media', requireRole('super_admin'), async (req: Request, res: Response) => {
   try {
+    const db = await getDb();
     const { to } = req.body;
     if (!to) return res.status(400).json({ success: false, error: 'Missing "to" (learner address)' });
+    const lesson = await db.lessons.findById(req.params.lessonId);
+    const course = lesson ? await db.courses.findById(lesson.course_id, req.auth!.organizationId) : null;
+    if (!lesson || !course) return res.status(404).json({ success: false, error: 'Lesson not found' });
     const { sendLessonWithMedia } = await import('../services/lessonMedia.js');
     const result = await sendLessonWithMedia(req.params.lessonId, to);
     res.json({ success: true, data: result });
@@ -143,16 +142,7 @@ coursesRouter.post('/generate', async (req: Request, res: Response) => {
       return res.status(400).json({ success: false, error: 'topic is required (min 2 characters)' });
     }
 
-    // Resolve organization
-    const { organizationId: orgFromBody } = req.body;
-    let organizationId: string | undefined = orgFromBody;
-    if (!organizationId) {
-      const org = await db.organizations.getDefault();
-      organizationId = org?.id;
-    }
-    if (!organizationId) {
-      return res.status(500).json({ success: false, error: 'No organization configured' });
-    }
+    const organizationId = req.auth!.organizationId;
 
     const { courseGenerator } = await import('../services/courseGenerator.js');
 
@@ -196,6 +186,13 @@ coursesRouter.put('/:id', async (req: Request, res: Response) => {
     const { id } = req.params;
     const { title, description, category, status, settings, fsm_definition_id } = req.body;
 
+    if (fsm_definition_id) {
+      const definition = await db.fsmDefinitions.findById(fsm_definition_id);
+      if (!definition || definition.organization_id !== req.auth!.organizationId) {
+        return res.status(404).json({ success: false, error: 'FSM definition not found' });
+      }
+    }
+
     const course = await db.courses.update(id, {
       title,
       description,
@@ -203,7 +200,7 @@ coursesRouter.put('/:id', async (req: Request, res: Response) => {
       status,
       settings,
       fsm_definition_id
-    });
+    }, req.auth!.organizationId);
 
     if (!course) {
       return res.status(404).json({ success: false, error: 'Course not found' });
@@ -226,7 +223,9 @@ coursesRouter.delete('/:id', async (req: Request, res: Response) => {
     const db = await getDb();
     const { id } = req.params;
 
-    await db.courses.delete(id);
+    const course = await db.courses.findById(id, req.auth!.organizationId);
+    if (!course) return res.status(404).json({ success: false, error: 'Course not found' });
+    await db.courses.delete(id, req.auth!.organizationId);
     logger.info(`Course deleted: ${id}`);
     
     res.json({ success: true });
@@ -245,7 +244,7 @@ coursesRouter.post('/:id/publish', async (req: Request, res: Response) => {
     const db = await getDb();
     const { id } = req.params;
 
-    const course = await db.courses.update(id, { status: 'published' });
+    const course = await db.courses.update(id, { status: 'published' }, req.auth!.organizationId);
     if (!course) {
       return res.status(404).json({ success: false, error: 'Course not found' });
     }
@@ -267,7 +266,7 @@ coursesRouter.post('/:id/unpublish', async (req: Request, res: Response) => {
     const db = await getDb();
     const { id } = req.params;
 
-    const course = await db.courses.update(id, { status: 'draft' });
+    const course = await db.courses.update(id, { status: 'draft' }, req.auth!.organizationId);
     if (!course) {
       return res.status(404).json({ success: false, error: 'Course not found' });
     }
@@ -290,7 +289,7 @@ coursesRouter.post('/:id/duplicate', async (req: Request, res: Response) => {
     const { id } = req.params;
     const { newTitle } = req.body;
 
-    const originalCourse = await db.courses.findById(id);
+    const originalCourse = await db.courses.findById(id, req.auth!.organizationId);
     if (!originalCourse) {
       return res.status(404).json({ success: false, error: 'Course not found' });
     }
@@ -337,6 +336,9 @@ coursesRouter.get('/:id/lessons', async (req: Request, res: Response) => {
     const db = await getDb();
     const { id } = req.params;
 
+    const course = await db.courses.findById(id, req.auth!.organizationId);
+    if (!course) return res.status(404).json({ success: false, error: 'Course not found' });
+
     const lessons = await db.lessons.findByCourse(id);
     res.json({ success: true, data: lessons });
   } catch (error) {
@@ -354,6 +356,9 @@ coursesRouter.post('/:id/lessons', async (req: Request, res: Response) => {
     const db = await getDb();
     const { id } = req.params;
     const { title, content, contentType, mediaUrl, sequenceOrder, durationMinutes, dayNumber, metadata } = req.body;
+
+    const course = await db.courses.findById(id, req.auth!.organizationId);
+    if (!course) return res.status(404).json({ success: false, error: 'Course not found' });
 
     if (!title) {
       return res.status(400).json({ success: false, error: 'Title is required' });
@@ -393,8 +398,11 @@ coursesRouter.post('/:id/lessons', async (req: Request, res: Response) => {
 coursesRouter.put('/:courseId/lessons/:lessonId', async (req: Request, res: Response) => {
   try {
     const db = await getDb();
-    const { lessonId } = req.params;
+    const { courseId, lessonId } = req.params;
     const { title, content, contentType, mediaUrl, sequenceOrder, durationMinutes, dayNumber, metadata } = req.body;
+
+    const course = await db.courses.findById(courseId, req.auth!.organizationId);
+    if (!course) return res.status(404).json({ success: false, error: 'Course not found' });
 
     const lesson = await db.lessons.update(lessonId, {
       title,
@@ -405,7 +413,7 @@ coursesRouter.put('/:courseId/lessons/:lessonId', async (req: Request, res: Resp
       durationMinutes,
       dayNumber,
       metadata
-    });
+    }, courseId);
 
     if (!lesson) {
       return res.status(404).json({ success: false, error: 'Lesson not found' });
@@ -426,9 +434,13 @@ coursesRouter.put('/:courseId/lessons/:lessonId', async (req: Request, res: Resp
 coursesRouter.delete('/:courseId/lessons/:lessonId', async (req: Request, res: Response) => {
   try {
     const db = await getDb();
-    const { lessonId } = req.params;
+    const { courseId, lessonId } = req.params;
 
-    await db.lessons.delete(lessonId);
+    const course = await db.courses.findById(courseId, req.auth!.organizationId);
+    if (!course) return res.status(404).json({ success: false, error: 'Course not found' });
+    const lesson = await db.lessons.findById(lessonId);
+    if (!lesson || lesson.course_id !== courseId) return res.status(404).json({ success: false, error: 'Lesson not found' });
+    await db.lessons.delete(lessonId, courseId);
     logger.info(`Lesson deleted: ${lessonId}`);
     
     res.json({ success: true });
@@ -446,6 +458,9 @@ coursesRouter.get('/:id/stats', async (req: Request, res: Response) => {
   try {
     const db = await getDb();
     const { id } = req.params;
+
+    const course = await db.courses.findById(id, req.auth!.organizationId);
+    if (!course) return res.status(404).json({ success: false, error: 'Course not found' });
 
     const enrollmentStats = await db.enrollments.getStats(id);
     const lessonCount = await db.lessons.countByCourse(id);

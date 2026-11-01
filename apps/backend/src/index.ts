@@ -12,6 +12,7 @@ import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import cron from 'node-cron';
 import dotenv from 'dotenv';
+import { configurationErrors, messagingConfiguration } from '@ekatra/delivery/configuration';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import * as Sentry from '@sentry/node';
@@ -37,47 +38,10 @@ if (process.env.SENTRY_DSN) {
 
 // ── Boot-time env validation ───────────────────────────────────────────────
 // Fail hard and loudly rather than degrading silently into an insecure state.
-(function validateEnv() {
-  const required: Record<string, string | undefined> = {
-    JWT_SECRET: process.env.JWT_SECRET,
-    DATABASE_URL: process.env.DATABASE_URL,
-    // REDIS_URL is optional — features degrade gracefully when absent
-  };
-
-  if (!process.env.REDIS_URL) {
-    console.warn('[boot] REDIS_URL not set — distributed lock and dedup disabled (acceptable for single-instance deploys)');
-  }
-
-  // At least one messaging provider must be configured
-  const hasTwilio = process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN && process.env.TWILIO_WHATSAPP_NUMBER;
-  const hasMeta = process.env.META_ACCESS_TOKEN && process.env.META_PHONE_NUMBER_ID;
-  if (!hasTwilio && !hasMeta) {
-    required['TWILIO_ACCOUNT_SID / META_ACCESS_TOKEN'] = undefined; // force failure below
-  }
-
-  // Webhook signature validation MUST be on in production
-  if (process.env.NODE_ENV === 'production' && !process.env.META_APP_SECRET && !hasTwilio) {
-    required['META_APP_SECRET'] = undefined;
-  }
-
-  const insecureDefaults: Record<string, string> = {
-    JWT_SECRET: 'your-secret-key',
-    DATABASE_URL: 'postgresql://ekatra:ekatra_password@localhost:5432/ekatra_db',
-  };
-
-  const errors: string[] = [];
-  for (const [key, value] of Object.entries(required)) {
-    if (!value) errors.push(`  ✗ ${key} is not set`);
-    else if (insecureDefaults[key] === value) errors.push(`  ✗ ${key} is still using insecure default value — change it`);
-  }
-
-  if (errors.length > 0) {
-    console.error('\nFATAL: Missing or insecure required environment variables:\n');
-    errors.forEach((e) => console.error(e));
-    console.error('\nSet these before starting the server. See .env.example for guidance.\n');
-    process.exit(1);
-  }
-})();
+const environmentErrors = configurationErrors(process.env, 'api');
+if (environmentErrors.length > 0) {
+  throw new Error(`Invalid API configuration: ${environmentErrors.join('; ')}`);
+}
 
 // Initialize Azure OpenAI (will log initialization status)
 import { azureOpenAI } from './lib/azureOpenAI.js';
@@ -94,6 +58,9 @@ import { analyticsRouter } from './routes/analytics.js';
 import { adminRouter } from './routes/admin.js';
 import { usersRouter } from './routes/users.js';
 import { fsmRouter } from './routes/fsm.js';
+import { createDefaultSyncRouter } from './routes/sync.js';
+import { createDefaultWhatsappAuthRouter } from './routes/authWhatsapp.js';
+import { logProxyChainOnce, trustProxyHops } from './lib/proxyDiagnostics.js';
 import { authMiddleware } from './middleware/auth.js';
 
 // Logger
@@ -103,19 +70,37 @@ const app: express.Application = express();
 const PORT = process.env.PORT || 3001;
 
 // Middleware
+// Behind the platform's proxies every request shares a proxy address; trust exactly as many hops
+// as there are (TRUST_PROXY_HOPS; 2 in production, 1 elsewhere) so the per-IP rate limiters see the
+// real client from X-Forwarded-For. Railway's public path crosses two proxies.
+const TRUST_PROXY_HOPS = trustProxyHops();
+app.set('trust proxy', TRUST_PROXY_HOPS);
+app.use(logProxyChainOnce(undefined, TRUST_PROXY_HOPS)); // once per boot: confirms the chain (addresses truncated)
 app.use(helmet());
 app.use(cors({
   origin: process.env.FRONTEND_URL || 'http://localhost:3000',
   credentials: true
 }));
-app.use(express.json({ limit: '10kb' }));
+// Keep the raw bytes — Cloud API signature verification hashes the exact body.
+const captureRawBody = (req: any, _res: unknown, buffer: Buffer) => { (req as express.Request).rawBody = Buffer.from(buffer); };
+// Route-scoped parsers run first (body-parser skips an already-parsed body):
+// provider webhooks carry long Indic messages / batched statuses well over 10kb,
+// and FSM/course saves are validated against their own (64KB) limits in-route.
+app.use('/api/webhooks',
+  express.json({ limit: '1mb', verify: captureRawBody }),
+  express.urlencoded({ extended: false, limit: '1mb' }));
+app.use(['/api/fsm', '/api/courses', '/api/sync'], express.json({ limit: '256kb', verify: captureRawBody }));
+app.use(express.json({
+  limit: '10kb',
+  verify: captureRawBody,
+}));
 app.use(express.urlencoded({ extended: false, limit: '10kb' }));
 
 // Rate limiter — 150 req/15 min per IP on all /api routes; webhooks skipped
 const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 150,
-  skip: (req) => req.path.includes('/webhooks'),
+  skip: (req) => req.path.includes('/webhooks') || req.path.startsWith('/sync/media/'),
   standardHeaders: true,
   legacyHeaders: false,
   message: { success: false, error: 'Rate limit exceeded. Please try again later.' },
@@ -138,11 +123,19 @@ app.use('/admin', express.static(publicDir));
 // Fallback: /admin with no trailing slash → redirect to /admin/
 app.get('/admin', (_req, res) => res.redirect('/admin/admin.html'));
 
+// Re-hosted authored-course media (importAuthoredCourse.ts writes here).
+// WhatsApp Cloud API fetches media by URL, so this must be publicly reachable in prod.
+app.use('/media', express.static(path.join(publicDir, 'media'), { maxAge: '7d', immutable: true }));
+
 // Routes — public
 app.use('/health', healthRouter);
+app.use('/api/auth/whatsapp', createDefaultWhatsappAuthRouter());
 app.use('/api/auth', authRouter);
 app.use('/api/webhooks', webhookRouter);
 app.use('/api/certificates', certificatesRouter);
+
+// Routes — Maya offline app sync (learner JWT, verified in-router); must precede the catch-all /api mount below
+app.use('/api/sync', createDefaultSyncRouter());
 
 // Routes — protected (require valid JWT)
 app.use('/api', authMiddleware, analyticsRouter);
@@ -166,33 +159,8 @@ async function initializeServices() {
       
       initializeDatabase({ connectionString: process.env.DATABASE_URL });
 
-      // Choose messaging provider: Twilio > Cloud API (Meta)
-      if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
-        const webhookBase = process.env.WEBHOOK_BASE_URL ||
-          (process.env.RAILWAY_PUBLIC_DOMAIN
-            ? `https://${process.env.RAILWAY_PUBLIC_DOMAIN}`
-            : undefined);
-        const statusCallbackUrl = webhookBase
-          ? `${webhookBase.replace(/\/+$/, '')}/api/webhooks/twilio`
-          : undefined;
-        initializeMessaging({
-          provider: 'twilio',
-          phoneNumberId: '',
-          accessToken: '',
-          twilioAccountSid: process.env.TWILIO_ACCOUNT_SID,
-          twilioAuthToken: process.env.TWILIO_AUTH_TOKEN,
-          twilioFromNumber: process.env.TWILIO_WHATSAPP_NUMBER,
-          statusCallbackUrl,
-        });
-        logger.info(`✅ Messaging: Twilio WhatsApp (${process.env.TWILIO_WHATSAPP_NUMBER})${statusCallbackUrl ? ` | StatusCallback: ${statusCallbackUrl}` : ''}`);
-      } else {
-        initializeMessaging({
-          provider: 'cloudapi',
-          phoneNumberId: process.env.META_PHONE_NUMBER_ID!,
-          accessToken: process.env.META_ACCESS_TOKEN!,
-        });
-        logger.info('✅ Messaging: Meta Cloud API');
-      }
+      initializeMessaging(messagingConfiguration(process.env));
+      logger.info('Messaging provider initialized');
 
       // Secondary channel: Telegram (learners addressed as tg:<chat_id>)
       if (process.env.TELEGRAM_BOT_TOKEN) {
@@ -238,6 +206,11 @@ async function initializeServices() {
       });
       
       scheduler = getScheduler();
+
+      if (messagingConfiguration(process.env).provider === 'cloudapi') {
+        const { startWebhookRecovery } = await import('./services/webhookRecovery.js');
+        startWebhookRecovery(Number(process.env.WEBHOOK_RECOVERY_INTERVAL_MS) || 15_000);
+      }
       
       logger.info('✅ Database and messaging services initialized');
     } catch (error) {
@@ -251,38 +224,28 @@ async function initializeServices() {
 // Cron fires enqueue jobs into BullMQ — the worker process does the actual work.
 // This keeps the HTTP server unblocked and prevents duplicate sends when running
 // multiple replicas (the worker acquires a distributed lock per job).
-cron.schedule('0 9 * * *', async () => {
+//
+// Course pushes: a half-hourly check runs every schedule whose send_time/days_of_week
+// match in its own timezone, at most once per schedule per local day. Half-hourly so
+// that :00 send times in both whole-hour zones (UTC) and half-hour zones (IST) fire
+// on time. (There is no separate unconditional 9 AM "all schedules" push — it ignored
+// send_time and days_of_week and double-sent schedules also matched by this check.)
+cron.schedule('0,30 * * * *', async () => {
   const { getScheduledPushQueue } = await import('./lib/queues.js');
   const q = getScheduledPushQueue();
+  const firedAt = new Date();
+  const slotKey = firedAt.toISOString().slice(0, 16); // "2026-04-06T09:30"
   if (q) {
-    await q.add('daily-push', { scheduleId: 'all', scheduleName: 'Daily 9AM push' }, {
-      jobId: `daily-push:${new Date().toISOString().slice(0, 10)}`, // one job per day
-      removeOnComplete: 100,
-      removeOnFail: 50,
-    });
-    logger.info('⏰ Daily push job enqueued');
-  } else if (scheduler) {
-    // Fallback: no Redis — run inline (single-instance only)
-    logger.warn('⚠️ Redis not available — running daily push inline (single-instance mode)');
-    await scheduler.executeScheduledPushes();
-  }
-}, { scheduled: true, timezone: 'Asia/Kolkata' });
-
-// Hourly schedule check
-cron.schedule('0 * * * *', async () => {
-  const { getScheduledPushQueue } = await import('./lib/queues.js');
-  const q = getScheduledPushQueue();
-  const hourKey = new Date().toISOString().slice(0, 13); // "2026-04-06T09"
-  if (q) {
-    await q.add('custom-schedule-check', { scheduleId: 'check', scheduleName: 'Hourly check' }, {
-      jobId: `schedule-check:${hourKey}`,
-      removeOnComplete: 24,
+    // The worker matches schedules at the job's enqueue time (job.timestamp).
+    await q.add('custom-schedule-check', { scheduleId: 'check', scheduleName: 'Schedule check' }, {
+      jobId: `schedule-check:${slotKey}`,
+      removeOnComplete: 48,
       removeOnFail: 10,
     });
-    logger.info('⏰ Hourly schedule-check job enqueued');
+    logger.info('⏰ Schedule-check job enqueued');
   } else if (scheduler) {
     logger.warn('⚠️ Redis not available — running schedule check inline');
-    await scheduler.checkCustomSchedules();
+    await scheduler.checkCustomSchedules(firedAt);
   }
 }, { scheduled: true, timezone: 'Asia/Kolkata' });
 
@@ -306,6 +269,20 @@ cron.schedule('0 9 * * *', async () => {
 
 // Error handling — Sentry captures unhandled errors before our JSON response
 app.use((err: Error, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  // Client errors (body-parser 413 too large / 400 malformed JSON, etc.) are
+  // not server faults — return their status instead of a 500.
+  const status = (err as any).status ?? (err as any).statusCode;
+  if (typeof status === 'number' && status >= 400 && status < 500) {
+    const type = (err as any).type;
+    logger.warn(`Client error ${status} on ${req.method} ${req.path}: ${type || err.message}`);
+    res.status(status).json({
+      success: false,
+      error: type === 'entity.too.large' ? 'Payload too large'
+        : type === 'entity.parse.failed' ? 'Malformed JSON'
+        : (err as any).expose ? err.message : 'Bad request',
+    });
+    return;
+  }
   if (process.env.SENTRY_DSN) {
     Sentry.captureException(err);
   }
@@ -322,7 +299,7 @@ app.use((err: Error, req: express.Request, res: express.Response, next: express.
 app.listen(PORT, async () => {
   logger.info('🚀 Ekatra Backend Started');
   logger.info(`📡 Server running on port ${PORT}`);
-  logger.info(`⏰ Daily course delivery scheduled for 9:00 AM IST`);
+  logger.info(`⏰ Course delivery: half-hourly schedule check (per-schedule send_time/timezone)`);
   logger.info(`🏥 Health check: http://localhost:${PORT}/health`);
   logger.info('='.repeat(50));
   

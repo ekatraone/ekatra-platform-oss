@@ -15,6 +15,9 @@ import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 import { useToast } from "@/components/ui/use-toast";
 import { apiClient } from "@/services/apiClient";
+import { fetchAllCourseRecords } from "@/lib/api";
+import { usePagedLearners } from "@/hooks/usePagedLearners";
+import ListPager from "@/components/dashboard/ListPager";
 import {
   Sheet,
   SheetContent,
@@ -102,10 +105,12 @@ const Learners = () => {
   const { toast } = useToast();
 
   // ── Data state ──────────────────────────────────────────────────────────
-  const [learners, setLearners] = useState<Learner[]>([]);
+  // One server-side page of learners; search runs on the server so every learner is reachable.
+  const {
+    learners, pagination, loading, fetching, error: learnersError,
+    refetch: refetchLearners, search, setSearch, setPage,
+  } = usePagedLearners<Learner>();
   const [courses, setCourses] = useState<Course[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [search, setSearch] = useState("");
 
   // ── Add single learner dialog ────────────────────────────────────────────
   const [addOpen, setAddOpen] = useState(false);
@@ -133,23 +138,19 @@ const Learners = () => {
 
   // ── Fetch ────────────────────────────────────────────────────────────────
 
-  const fetchAll = async () => {
-    setLoading(true);
-    try {
-      const [lr, cr] = await Promise.all([
-        apiClient.getLearners() as Promise<any>,
-        apiClient.getCourses({ status: "published" }) as Promise<any>,
-      ]);
-      setLearners(lr?.data || []);
-      setCourses(cr?.data || []);
-    } catch (err: any) {
-      toast({ title: "Failed to load", description: err.message, variant: "destructive" });
-    } finally {
-      setLoading(false);
-    }
-  };
+  // Course pickers need every published course, not just the first page.
+  useEffect(() => {
+    fetchAllCourseRecords({ status: "published" })
+      .then((rows) => setCourses(rows as Course[]))
+      .catch((err: any) => toast({ title: "Failed to load courses", description: err.message, variant: "destructive" }));
+  }, []);
 
-  useEffect(() => { fetchAll(); }, []);
+  useEffect(() => {
+    if (learnersError) toast({ title: "Failed to load", description: learnersError.message, variant: "destructive" });
+  }, [learnersError]);
+
+  // Re-fetch the current page (keeps the active search and page).
+  const fetchAll = () => { refetchLearners(); };
 
   // ── Add single learner ──────────────────────────────────────────────────
 
@@ -264,17 +265,6 @@ const Learners = () => {
     }
   };
 
-  // ── Filtered learners ───────────────────────────────────────────────────
-
-  const filtered = learners.filter((l) => {
-    if (!search) return true;
-    const q = search.toLowerCase();
-    return (
-      (l.name || "").toLowerCase().includes(q) ||
-      l.phone.includes(q)
-    );
-  });
-
   // ── Render ───────────────────────────────────────────────────────────────
 
   return (
@@ -314,7 +304,7 @@ const Learners = () => {
             <div className="flex items-center justify-center py-20">
               <Loader2 className="h-6 w-6 animate-spin text-muted-foreground" />
             </div>
-          ) : filtered.length === 0 ? (
+          ) : learners.length === 0 ? (
             <p className="text-muted-foreground py-10 text-center">No learners found.</p>
           ) : (
             <div className="border rounded-lg overflow-hidden">
@@ -329,7 +319,7 @@ const Learners = () => {
                   </tr>
                 </thead>
                 <tbody className="divide-y">
-                  {filtered.map((learner) => (
+                  {learners.map((learner) => (
                     <tr key={learner.id} className="hover:bg-muted/30 cursor-pointer" onClick={() => openDetail(learner)}>
                       <td className="px-4 py-3 font-medium">{learner.name || "—"}</td>
                       <td className="px-4 py-3 text-muted-foreground">{learner.phone}</td>
@@ -352,6 +342,7 @@ const Learners = () => {
               </table>
             </div>
           )}
+          <ListPager pagination={pagination} onPageChange={setPage} disabled={fetching} />
         </div>
       </main>
 

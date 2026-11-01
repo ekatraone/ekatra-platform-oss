@@ -52,7 +52,12 @@ export class QAService {
   /**
    * Handle text question using Socratic method
    */
-  async handleTextQuestion(learner: any, enrollment: any, question: string): Promise<void> {
+  async handleTextQuestion(
+    learner: any,
+    enrollment: any,
+    question: string,
+    options: { followUpButtons?: boolean } = {},
+  ): Promise<void> {
     const db = await getDb();
     const messaging = await getMessaging();
     
@@ -120,14 +125,17 @@ export class QAService {
 
       await messaging.sendText(learner.phone, { text: response });
 
-      // Offer to continue or end
-      await messaging.sendInteractiveButtons(learner.phone, {
-        body: 'Would you like to ask more or continue learning?',
-        buttons: [
-          { id: 'ask_question', title: 'Ask Another' },
-          { id: 'next', title: 'Continue Course' }
-        ]
-      });
+      // Offer to continue or end — unless the caller (e.g. the FSM doubt loop)
+      // sends its own follow-up prompt, which these buttons would compete with.
+      if (options.followUpButtons !== false) {
+        await messaging.sendInteractiveButtons(learner.phone, {
+          body: 'Would you like to ask more or continue learning?',
+          buttons: [
+            { id: 'ask_question', title: 'Ask Another' },
+            { id: 'next', title: 'Continue Course' }
+          ]
+        });
+      }
 
     } catch (error: any) {
       logger.error('Q&A error:', error);

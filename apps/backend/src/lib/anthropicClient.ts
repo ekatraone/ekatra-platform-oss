@@ -5,7 +5,7 @@
  * Returns OpenAI-compatible `{ choices: [{ message: { content } }] }` shape
  * so existing callers (courseGenerator, qaService) need minimal changes.
  *
- * Endpoint: https://ekatra-bots.services.ai.azure.com/anthropic
+ * Endpoint: https://<your-resource>.services.ai.azure.com/anthropic
  * Auth:     x-api-key header (AZURE_ANTHROPIC_API_KEY)
  */
 

@@ -31,14 +31,12 @@ function clearSession() {
 }
 
 async function request<T>(endpoint: string, options: RequestInit = {}, withAuth = true): Promise<T> {
-  const headers: HeadersInit = {
-    'Content-Type': 'application/json',
-    ...options.headers,
-  };
+  const headers = new Headers(options.headers);
+  headers.set('Content-Type', 'application/json');
 
   if (withAuth) {
     const token = getSession()?.token;
-    if (token) headers.Authorization = `Bearer ${token}`;
+    if (token) headers.set('Authorization', `Bearer ${token}`);
   }
 
   const res = await fetch(`${API_URL}${endpoint}`, {

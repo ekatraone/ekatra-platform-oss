@@ -1,4 +1,4 @@
-name: CI / Deploy
+name: CI
 
 on:
   push:
@@ -10,56 +10,37 @@ jobs:
   build:
     name: Build & Typecheck
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
 
       - uses: pnpm/action-setup@v3
         with:
-          version: 9
+          version: 10.28.1
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version-file: .nvmrc
           cache: pnpm
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Build packages
-        run: pnpm --filter @ekatra/database build && pnpm --filter @ekatra/messaging build
+      - name: Build all shipped packages and applications
+        run: pnpm build
 
-      - name: Build backend
-        run: pnpm --filter @ekatra/backend build
-
-  deploy:
-    name: Deploy to Railway
-    runs-on: ubuntu-latest
-    needs: build
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Railway CLI
-        run: npm install -g @railway/cli
-
-      - name: Deploy to production
-        run: railway up --detach
+      - name: Run regression tests
+        run: pnpm test
         env:
-          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
-          RAILWAY_PROJECT_ID: ${{ secrets.RAILWAY_PROJECT_ID }}
-          RAILWAY_SERVICE_ID: ${{ secrets.RAILWAY_SERVICE_ID }}
-
-  sync-backup:
-    name: Sync backup repo
-    runs-on: ubuntu-latest
-    needs: deploy
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Push to backup
-        run: |
-          git remote add backup https://x-access-token:${{ secrets.BACKUP_REPO_TOKEN }}@github.com/iabheejit/ekatra-platform-backup.git
-          git push backup main --force
+          TEST_POSTGRES_URL: postgresql://postgres:postgres@localhost:5432/postgres

@@ -56,8 +56,8 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 interface UsersListProps {
   users: AppUser[];
   onAddUser: (user: Partial<AppUser>) => Promise<void>;
-  onUpdateUser: (userId: number, updates: Partial<AppUser>) => Promise<void>;
-  onDeleteUser: (userId: number) => Promise<void>;
+  onUpdateUser: (userId: string, updates: Partial<AppUser>) => Promise<void>;
+  onDeleteUser: (userId: string) => Promise<void>;
   adminRequired?: boolean;
 }
 
@@ -71,7 +71,7 @@ type UserFormValues = z.infer<typeof userFormSchema>;
 
 const UsersList = ({ users, onAddUser, onUpdateUser, onDeleteUser, adminRequired = false }: UsersListProps) => {
   const [searchTerm, setSearchTerm] = useState("");
-  const [deleteUserId, setDeleteUserId] = useState<number | null>(null);
+  const [deleteUserId, setDeleteUserId] = useState<string | null>(null);
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);
   const [isAddUserOpen, setIsAddUserOpen] = useState(false);
   const [editingUser, setEditingUser] = useState<AppUser | null>(null);
@@ -125,7 +125,7 @@ const UsersList = ({ users, onAddUser, onUpdateUser, onDeleteUser, adminRequired
     });
   };
 
-  const handleDeleteClick = (userId: number) => {
+  const handleDeleteClick = (userId: string) => {
     setDeleteUserId(userId);
     setShowDeleteDialog(true);
   };

@@ -13,7 +13,8 @@ export function getRedis(): Redis | null {
   const url = process.env.REDIS_URL;
   if (!url) return null;
 
-  client = new Redis(url, { maxRetriesPerRequest: 3, enableReadyCheck: true, lazyConnect: false });
+  // BullMQ blocking consumers require unlimited per-request retries.
+  client = new Redis(url, { maxRetriesPerRequest: null, enableReadyCheck: true, lazyConnect: false });
   client.on('error', (err) => console.error('[worker] Redis error:', err));
   return client;
 }

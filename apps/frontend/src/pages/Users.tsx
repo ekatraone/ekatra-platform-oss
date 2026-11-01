@@ -7,11 +7,21 @@ import { useToast } from "@/components/ui/use-toast";
 import { apiClient } from "@/services/apiClient";
 import { RequireRole } from "@/components/AuthProvider";
 import { Alert, AlertTitle, AlertDescription } from "@/components/ui/alert";
-import { AlertCircle } from "lucide-react";
+import { AlertCircle, Copy } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 
 // Map raw backend user → AppUser shape expected by UsersList
 const toAppUser = (u: any, idx: number) => ({
-  id: idx + 1, // UsersList uses id as number key; backend id stored in _backendId
+  id: u.id,
   _backendId: u.id,
   name: u.name || u.email.split('@')[0],
   email: u.email,
@@ -24,6 +34,9 @@ const toAppUser = (u: any, idx: number) => ({
 const Users = () => {
   const [users, setUsers] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
+  // Temporary password returned once by POST /api/users — shown to the admin a single time,
+  // held only in memory, never logged or persisted.
+  const [invite, setInvite] = useState<{ email: string; password: string } | null>(null);
   const { toast } = useToast();
 
   const fetchUsers = async () => {
@@ -41,12 +54,22 @@ const Users = () => {
   useEffect(() => { fetchUsers(); }, []);
 
   const addUser = async (data: any) => {
-    await apiClient.post('/api/users', { email: data.email, name: data.name, role: data.role });
-    toast({ title: "User invited", description: `${data.email} has been added.` });
+    let res: any;
+    try {
+      res = await apiClient.post('/api/users', { email: data.email, name: data.name, role: data.role });
+    } catch (err: any) {
+      toast({ title: "Invite failed", description: err.message, variant: "destructive" });
+      throw err;
+    }
+    if (typeof res?.temporaryPassword === 'string') {
+      setInvite({ email: data.email, password: res.temporaryPassword });
+    } else {
+      toast({ title: "User invited", description: `${data.email} has been added.` });
+    }
     fetchUsers();
   };
 
-  const updateUser = async (userId: number, updates: any) => {
+  const updateUser = async (userId: string, updates: any) => {
     const backendId = users.find(u => u.id === userId)?._backendId;
     if (!backendId) return;
     await apiClient.put(`/api/users/${backendId}`, updates);
@@ -54,7 +77,7 @@ const Users = () => {
     fetchUsers();
   };
 
-  const deleteUser = async (userId: number) => {
+  const deleteUser = async (userId: string) => {
     const backendId = users.find(u => u.id === userId)?._backendId;
     if (!backendId) return;
     await apiClient.delete(`/api/users/${backendId}`);
@@ -96,6 +119,40 @@ const Users = () => {
           </RequireRole>
         </div>
       </main>
+
+      {/* One-time temporary password for a newly invited user */}
+      <Dialog open={!!invite} onOpenChange={(open) => { if (!open) setInvite(null); }}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>User invited</DialogTitle>
+            <DialogDescription>
+              Share this temporary password with {invite?.email} over a secure channel.
+              It is shown only once and cannot be retrieved after you close this dialog.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex gap-2">
+            <Input readOnly value={invite?.password ?? ''} className="font-mono" onFocus={(e) => e.target.select()} />
+            <Button
+              type="button"
+              variant="outline"
+              onClick={async () => {
+                if (!invite) return;
+                try {
+                  await navigator.clipboard.writeText(invite.password);
+                  toast({ title: "Copied", description: "Temporary password copied to clipboard." });
+                } catch {
+                  toast({ title: "Copy failed", description: "Select the password and copy it manually.", variant: "destructive" });
+                }
+              }}
+            >
+              <Copy className="h-4 w-4 mr-1" /> Copy
+            </Button>
+          </div>
+          <DialogFooter>
+            <Button onClick={() => setInvite(null)}>Done</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 };

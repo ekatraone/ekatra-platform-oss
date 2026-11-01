@@ -1,10 +1,12 @@
 /**
- * BullMQ processor — Scheduled Push / Hourly Schedule Check
+ * BullMQ processor — Scheduled Push / Periodic Schedule Check
  *
  * Handles two job types on the "scheduled-push" queue:
  *
- *  - daily-push           → run executeScheduledPushes() for all active schedules
- *  - custom-schedule-check → run checkCustomSchedules() for time-matched schedules
+ *  - custom-schedule-check → run the schedules due now (send_time/days_of_week in
+ *                            the schedule's timezone), at most once per local day
+ *  - daily-push (legacy)   → same as custom-schedule-check
+ *  - <scheduleId>          → run one schedule immediately (manual trigger)
  *
  * The processor runs in a separate worker process, so it never blocks the HTTP server.
  * Distributed dedup is enforced by BullMQ jobId uniqueness + Redis lock in the
@@ -14,22 +16,76 @@
 import { Job } from 'bullmq';
 import { logger } from '../lib/logger.js';
 import { db, initializeDatabase } from '@ekatra/database';
+import { getRedis } from '../lib/redis.js';
 
 export interface ScheduledPushPayload {
   scheduleId: string;
   scheduleName: string;
+  /** ISO time the cron tick fired — schedule matching is evaluated at this instant. */
+  firedAt?: string;
+}
+
+// In-process fallback for the per-day run key when Redis is not configured.
+const localRunKeys = new Set<string>();
+
+/** Claim the once-per-local-day run for a schedule. False if already claimed. */
+async function claimScheduleRun(key: string): Promise<boolean> {
+  const redis = getRedis();
+  if (!redis) {
+    if (localRunKeys.has(key)) return false;
+    localRunKeys.add(key);
+    return true;
+  }
+  return (await redis.set(key, '1', 'EX', 48 * 3600, 'NX')) === 'OK';
+}
+
+async function releaseScheduleRun(key: string): Promise<void> {
+  const redis = getRedis();
+  if (!redis) {
+    localRunKeys.delete(key);
+    return;
+  }
+  await redis.del(key);
+}
+
+async function runDueSchedules(at: Date): Promise<{ totalSent: number; totalFailed: number }> {
+  const { scheduleDueAt, scheduleRunKey } = await import('@ekatra/delivery');
+  const schedules = await db.schedules.findActive();
+  let totalSent = 0;
+  let totalFailed = 0;
+
+  for (const schedule of schedules) {
+    const due = scheduleDueAt(schedule, at);
+    if (!due) continue;
+
+    const runKey = scheduleRunKey(schedule.id, due.localDate);
+    if (!(await claimScheduleRun(runKey))) {
+      logger.info(`[worker] Schedule "${schedule.name}" already ran for ${due.localDate} — skipping`);
+      continue;
+    }
+
+    try {
+      const delivery = await getCourseDelivery();
+      const result = await delivery.executeSchedule(schedule.id);
+      totalSent += result.sent;
+      totalFailed += result.failed;
+      logger.info(`[worker] Schedule "${schedule.name}" done — sent=${result.sent} failed=${result.failed}`);
+    } catch (err) {
+      // Nothing was confirmed sent — free the day's key so the next check retries.
+      await releaseScheduleRun(runKey).catch(() => {});
+      logger.error(`[worker] Schedule "${schedule.id}" failed:`, err);
+      totalFailed++;
+    }
+  }
+  return { totalSent, totalFailed };
 }
 
 // Lazy singleton — CourseDeliveryService is heavyweight, only instantiate once
-let courseDelivery: any | null = null;
+let courseDelivery: import('@ekatra/delivery').CourseDeliveryService | null = null;
 
 async function getCourseDelivery() {
   if (!courseDelivery) {
-    // Resolve via monorepo-relative path: worker/src/jobs/ → backend/src/services/
-    // Works in both tsx (dev) and compiled JS (dist) because the layout is mirrored.
-    const { CourseDeliveryService } = await import(
-      '../../../backend/src/services/courseDelivery.js'
-    );
+    const { CourseDeliveryService } = await import('@ekatra/delivery');
     courseDelivery = new CourseDeliveryService();
   }
   return courseDelivery;
@@ -46,63 +102,24 @@ export async function processScheduledPush(job: Job<ScheduledPushPayload>): Prom
     initializeDatabase();
   }
 
-  if (scheduleId === 'all') {
-    // Daily 9 AM push — execute all active schedules
-    const schedules = await db.schedules.findActive();
-    let totalSent = 0;
-    let totalFailed = 0;
+  if (scheduleId === 'all' || scheduleId === 'check') {
+    // Schedule check (and legacy 'all' daily jobs still in the queue): run only
+    // the schedules whose send_time/days_of_week match in their own timezone.
+    // Match against the intended fire time, not the worker's wall clock — the
+    // job may have waited behind a long push on this concurrency-1 queue.
+    const firedAt = new Date(job.data.firedAt ?? job.timestamp ?? Date.now());
+    const { totalSent, totalFailed } = await runDueSchedules(Number.isNaN(firedAt.getTime()) ? new Date() : firedAt);
 
-    for (const schedule of schedules) {
-      try {
-        const delivery = await getCourseDelivery();
-        const result = await delivery.executeSchedule(schedule.id);
-        totalSent += result.sent;
-        totalFailed += result.failed;
-        logger.info(`[worker] Schedule "${schedule.name}" done — sent=${result.sent} failed=${result.failed}`);
-      } catch (err) {
-        logger.error(`[worker] Schedule "${schedule.id}" failed:`, err);
-        totalFailed++;
-      }
-    }
-
-    logger.info(`[worker] Daily push complete — sent=${totalSent} failed=${totalFailed} duration=${Date.now() - start}ms`);
+    logger.info(`[worker] Schedule check complete — sent=${totalSent} failed=${totalFailed} duration=${Date.now() - start}ms`);
+    if (totalFailed > 0) throw new Error(`Scheduled delivery failed for ${totalFailed} recipients or schedules`);
     await job.updateProgress(100);
-
-  } else if (scheduleId === 'check') {
-    // Hourly check — run time-matched custom schedules
-    const now = new Date();
-    const currentHour = now.getHours();
-    const currentMinute = now.getMinutes();
-    const currentDay = now.getDay();
-
-    const schedules = await db.schedules.findActive();
-
-    for (const schedule of schedules) {
-      const [scheduleHour, scheduleMinute] = schedule.send_time.split(':').map(Number);
-      const daysOfWeek: number[] = schedule.days_of_week || [1, 2, 3, 4, 5];
-
-      if (
-        currentHour === scheduleHour &&
-        currentMinute === scheduleMinute &&
-        daysOfWeek.includes(currentDay)
-      ) {
-        try {
-          const delivery = await getCourseDelivery();
-          const result = await delivery.executeSchedule(schedule.id);
-          logger.info(`[worker] Custom schedule "${schedule.name}" done — sent=${result.sent} failed=${result.failed}`);
-        } catch (err) {
-          logger.error(`[worker] Custom schedule "${schedule.id}" failed:`, err);
-        }
-      }
-    }
-
-    logger.info(`[worker] Hourly check complete — duration=${Date.now() - start}ms`);
 
   } else {
     // Single specific schedule (e.g. manually triggered via API)
     const delivery = await getCourseDelivery();
     const result = await delivery.executeSchedule(scheduleId);
     logger.info(`[worker] Single schedule "${scheduleId}" done — sent=${result.sent} failed=${result.failed}`);
+    if (result.failed > 0) throw new Error(`Schedule ${scheduleId} failed for ${result.failed} recipients`);
     await job.updateProgress(100);
   }
 }

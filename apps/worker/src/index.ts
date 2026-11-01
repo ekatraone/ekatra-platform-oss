@@ -9,12 +9,25 @@
  * because distributed locks prevent duplicate processing.
  */
 
-import 'dotenv/config';
-import { Worker, QueueEvents } from 'bullmq';
+import dotenv from 'dotenv';
+import { fileURLToPath } from 'node:url';
+import { Worker } from 'bullmq';
+import { initializeDatabase } from '@ekatra/database';
+import { initializeMessaging, initializeTelegram } from '@ekatra/messaging';
+import { configurationErrors, messagingConfiguration } from '@ekatra/delivery/configuration';
 import { logger } from './lib/logger.js';
 import { getRedis } from './lib/redis.js';
 import { processScheduledPush, type ScheduledPushPayload } from './jobs/scheduledPush.js';
 import { processFlashcardReminder, type FlashcardReminderPayload } from './jobs/flashcardReminder.js';
+
+dotenv.config();
+dotenv.config({ path: fileURLToPath(new URL('../../../.env', import.meta.url)) });
+
+const errors = configurationErrors(process.env, 'worker');
+if (errors.length > 0) throw new Error(`Invalid worker configuration: ${errors.join('; ')}`);
+initializeDatabase({ connectionString: process.env.DATABASE_URL });
+initializeMessaging(messagingConfiguration(process.env));
+if (process.env.TELEGRAM_BOT_TOKEN) initializeTelegram(process.env.TELEGRAM_BOT_TOKEN);
 
 const REDIS_URL = process.env.REDIS_URL;
 if (!REDIS_URL) {
@@ -22,7 +35,7 @@ if (!REDIS_URL) {
   process.exit(1);
 }
 
-const connection = { url: REDIS_URL };
+const connection = getRedis()!;
 
 // ── Scheduled Push Worker ─────────────────────────────────────────────────
 
@@ -84,4 +97,4 @@ process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 
 logger.info('[worker] Ekatra Worker started. Listening for jobs...');
-logger.info(`[worker] REDIS_URL: ${REDIS_URL.replace(/:[^:@]+@/, ':***@')}`);
+logger.info('[worker] Redis configured');

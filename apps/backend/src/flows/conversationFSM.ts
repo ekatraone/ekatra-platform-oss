@@ -9,13 +9,80 @@
  *   learner.metadata.fsm = { state, data }
  */
 
+import { randomUUID } from 'node:crypto';
 import { logger } from '../lib/logger.js';
 import { sm2Review, labelToQuality } from '../lib/fsrs.js';
 
 const delay = (ms: number) => new Promise(r => setTimeout(r, ms));
 
+// Hard cap on background course generation. Sized for one slow reasoning-model
+// attempt plus a retry and the DB save; a late result is discarded anyway (see
+// generationId), so this only bounds how long the learner waits for an answer.
+const GENERATION_TIMEOUT_MS = 180_000;
+
+// ── Input normalisation ────────────────────────────────────────────────────
+
+// Edge characters with no meaning in free text: whitespace, emoji (incl. modifiers,
+// variation selector, keycap, and the ZWJ that glues emoji sequences).
+const EDGE_NOISE = /^[\s\p{Extended_Pictographic}\p{Emoji_Modifier}\uFE0F\u20E3\u200D]+|[\s\p{Extended_Pictographic}\p{Emoji_Modifier}\uFE0F\u20E3\u200D]+$/gu;
+
+/**
+ * Cleans learner free text (topics, goals, questions) without destroying it:
+ * drops control and invisible format characters (zero-width space, BOM, bidi
+ * overrides, …) and edge emoji, collapses whitespace. Keeps every script's
+ * letters and symbols like "C++" / "C#" / "?". ZWNJ/ZWJ are kept inside the
+ * text because Indic scripts use them to shape conjuncts.
+ */
+export function cleanFreeText(s: string): string {
+  return s
+    .replace(/(?![\u200C\u200D])\p{Cf}/gu, '')
+    .replace(/\p{Cc}/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(EDGE_NOISE, '')
+    .trim();
+}
+
+/**
+ * Normalises input for matching commands, button ids and map keys: lowercases
+ * and strips leading/trailing punctuation/emoji so "new topic?" → "new topic".
+ * Unicode-aware — letters (\p{L}), combining marks (\p{M}, e.g. Devanagari
+ * matras) and digits survive, so "हिंदी" stays "हिंदी".
+ */
+export function normalizeCommand(s: string): string {
+  return cleanFreeText(s)
+    .toLowerCase()
+    .replace(/^[^\p{L}\p{M}\p{N}]+|[^\p{L}\p{M}\p{N}]+$/gu, '')
+    .trim();
+}
+
+/** Per-enrollment slot stored at learner.metadata.fsm_dynamic (dynamic + authored engines). */
+export interface DynamicSlot {
+  state?: string | null;
+  version?: number;
+  /** Absent on slots written before per-enrollment keying — those are trusted as-is. */
+  enrollmentId?: string;
+  fsmDefinitionId?: string | null;
+}
+
+/**
+ * Returns the saved node id only if the slot belongs to this enrollment and FSM
+ * definition. A slot from another enrollment (new course) or definition
+ * (re-import) means the learner starts this course from the top.
+ */
+export function resolveDynamicState(slot: DynamicSlot | undefined | null, enrollment: any): string | undefined {
+  if (!slot?.state) return undefined;
+  if (slot.enrollmentId && slot.enrollmentId !== enrollment?.id) return undefined;
+  if (slot.fsmDefinitionId && slot.fsmDefinitionId !== enrollment?.fsm_definition_id) return undefined;
+  return slot.state;
+}
+
+const RESTART_COMMANDS = new Set(['restart', 'reset', 'start over']);
+/** Pause between the feedback on a review answer and the next review question. */
+const REVIEW_NEXT_QUESTION_DELAY_MS = process.env.NODE_ENV === 'test' || process.env.NODE_TEST_CONTEXT ? 0 : 1500;
+
+const NEW_TOPIC_COMMANDS = new Set(['new topic', 'new course']);
+
 const getDb = () => import('@ekatra/database').then((m) => m.db);
-const getQuery = () => import('@ekatra/database').then((m) => m.query);
 const getMessaging = () => import('@ekatra/messaging').then((m) => m.messaging);
 
 // ── State types ────────────────────────────────────────────────────────────
@@ -44,6 +111,11 @@ export interface FSMData {
   reviewCardIds?: string[];   // ordered list of due flashcard IDs
   reviewCardIndex?: number;   // current position in reviewCardIds
   reviewStep?: 'front' | 'back'; // which side is currently shown
+  // Identifies the in-flight course generation; a result for any other id is stale
+  generationId?: string;
+  // Day-end review: how many bare A/B/C answers were taken for this review lesson,
+  // so each reply is graded against the question it answers (buttons carry no id)
+  reviewAnswers?: { lessonId: string; count: number };
 }
 
 export interface FSMContext {
@@ -66,6 +138,21 @@ interface IncomingMessage {
 }
 
 // ── FSM core ───────────────────────────────────────────────────────────────
+
+/**
+ * What a learner's chat request asks the course generator for. The learner id is stamped on the
+ * course (requestedByLearnerId) so deleting their account can tell their own courses from admin ones.
+ */
+export function courseRequestFor(learner: any, data: FSMData, defaultOrganizationId?: string) {
+  return {
+    topic: data.topic!,
+    goal: data.goal,
+    language: data.language || learner.language || 'en',
+    style: data.style || 'casual',
+    organizationId: defaultOrganizationId || learner.organization_id,
+    requestedByLearnerId: learner.id as string,
+  };
+}
 
 export class ConversationFSM {
   private courseDelivery: any = null;
@@ -100,39 +187,63 @@ export class ConversationFSM {
    * Main entry point — processes one inbound message for a learner.
    */
   async process(learner: any, message: IncomingMessage): Promise<void> {
-    // ── Dynamic FSM engine: activates when enrollment has fsm_definition_id ─
-    try {
-      const db = await getDb();
-      const enrollment = await db.enrollments.findActiveByLearner(learner.id);
-      if (enrollment?.fsm_definition_id) {
-        await this.processDynamic(learner, enrollment, message);
-        return;
-      }
-    } catch (dynErr) {
-      logger.error('Dynamic FSM lookup failed, falling back to hardcoded engine:', dynErr);
-    }
-    // ── Hardcoded engine (fallback for existing learners) ─────────────────
-    const ctx = this.getContext(learner);
-    let input = (
+    const rawInput = (
       message.text ||
       message.buttonPayload ||
       message.listReplyId ||
       message.buttonReplyId ||
       ''
     ).trim();
+    // Normalise: strip leading/trailing punctuation so "new topic?" → "new topic"
+    const lower = normalizeCommand(rawInput);
+
+    // ── Dynamic FSM engine: activates when enrollment has fsm_definition_id ─
+    let activeEnrollment: any = null;
+    try {
+      const db = await getDb();
+      const enrollment = await db.enrollments.findActiveByLearner(learner.id);
+      if (enrollment?.fsm_definition_id) {
+        // Global commands first — otherwise help/restart/new topic never reach
+        // a learner in a dynamic or authored course.
+        if (await this.handleDynamicGlobalCommand(learner, enrollment, lower)) return;
+        await this.processDynamic(learner, enrollment, message);
+        return;
+      }
+      activeEnrollment = enrollment;
+    } catch (dynErr) {
+      logger.error('Dynamic FSM lookup failed, falling back to hardcoded engine:', dynErr);
+    }
+    // ── Hardcoded engine (fallback for existing learners) ─────────────────
+    const ctx = this.getContext(learner);
+    let input = rawInput;
+    // Free text (topics, goals, questions) keeps its script, case and symbols.
+    const freeText = cleanFreeText(rawInput);
 
     logger.info(`🔄 FSM [${learner.id}] state=${ctx.state} input="${input.substring(0, 50)}"`);
 
     // ── Global commands — handled in ANY state ─────────────────────────────
-    // Normalise: strip leading/trailing punctuation so "new topic?" → "new topic"
-    const lower = input.toLowerCase().replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '').trim();
-    if (lower === 'restart' || lower === 'reset' || lower === 'new topic' || lower === 'start over' || lower === 'new course') {
+    if (RESTART_COMMANDS.has(lower) && activeEnrollment) {
+      // Restart the current course from Day 1 (not the whole onboarding).
+      if (await this.restartEnrollment(learner, ctx, activeEnrollment)) return;
+    }
+    if (NEW_TOPIC_COMMANDS.has(lower) && activeEnrollment) {
+      // Leave the current course and go straight to picking a new topic —
+      // routing through idle would just resume the active enrollment.
+      await this.startNewTopic(learner, ctx, activeEnrollment);
+      return;
+    }
+    if (RESTART_COMMANDS.has(lower) || NEW_TOPIC_COMMANDS.has(lower)) {
       await this.transitionTo(learner, ctx, 'idle', {});
       const messaging = await getMessaging();
       await messaging.sendText(learner.phone, {
         text: '🔄 No problem — let\'s start fresh!',
       });
       await this.handleIdle(learner, ctx, message);
+      return;
+    }
+    // Course-complete message offers a "New Course" button whose id is 'menu'.
+    if (lower === 'menu' && !activeEnrollment && (ctx.state === 'complete' || ctx.state === 'learning')) {
+      await this.handleComplete(learner, ctx, 'new_course');
       return;
     }
     if (lower === 'help' || lower === 'menu') {
@@ -166,10 +277,10 @@ export class ConversationFSM {
           await this.handleStyleInput(learner, ctx, input);
           break;
         case 'topic_input':
-          await this.handleTopicInput(learner, ctx, input);
+          await this.handleTopicInput(learner, ctx, freeText);
           break;
         case 'goal_input':
-          await this.handleGoalInput(learner, ctx, input);
+          await this.handleGoalInput(learner, ctx, input, freeText);
           break;
         case 'confirming':
           await this.handleConfirming(learner, ctx, input);
@@ -182,7 +293,7 @@ export class ConversationFSM {
           await this.handleLearning(learner, ctx, message);
           break;
         case 'doubt':
-          await this.handleDoubt(learner, ctx, message, input);
+          await this.handleDoubt(learner, ctx, message, input, freeText);
           break;
         case 'review_flashcard':
           await this.handleReviewFlashcard(learner, ctx, input);
@@ -268,17 +379,40 @@ export class ConversationFSM {
     await db.learners.update(learner.id, { language: lang });
     learner.language = lang;
 
-    await this.transitionTo(learner, ctx, 'style_input', ctx.data);
+    await this.transitionTo(learner, ctx, 'topic_input', ctx.data);
 
     const isHindi = lang === 'hi';
+    await messaging.sendText(learner.phone, {
+      text: isHindi
+        ? `बढ़िया! 🤩\n\nमैं *Alfred* हूँ — आपका AI टीचर, जो किसी भी विषय पर कोर्स बना सकता है।\n\nआप क्या सीखना चाहते हैं? (उदाहरण: "Python basics" या "शेयर मार्केट की बेसिक्स")`
+        : `That's amazing! 🤩\n\nI'm *Alfred*, your AI tutor — I can create a course on any topic you choose.\n\nWhat would you like to learn?\n\n_Example: "Python basics" or "Marketing fundamentals"_`,
+    });
+  }
+
+  /** Asks how the learner wants this course taught. Asked for every new course, after the topic. */
+  private async sendStylePrompt(learner: any, ctx: FSMContext): Promise<void> {
+    const messaging = await getMessaging();
+    const isHindi = ctx.data.language === 'hi';
     await messaging.sendInteractiveButtons(learner.phone, {
       body: isHindi
-        ? `बढ़िया! 🤩\n\nमैं *Alfred* हूँ — आपका AI टीचर, जो किसी भी विषय पर कोर्स बना सकता है।\n\nआप किस तरह से सीखना पसंद करते हैं?`
-        : `That's amazing! 🤩\n\nI'm *Alfred*, your AI tutor — I can create a course on any topic you choose.\n\nHow do you prefer to learn?`,
+        ? `अच्छा चुनाव! 📚 *${ctx.data.topic}*\n\nआप इसे किस तरह से सीखना पसंद करेंगे?`
+        : `Great choice! 📚 *${ctx.data.topic}*\n\nHow would you like this course taught?`,
       buttons: [
         { id: 'style_professional', title: isHindi ? 'औपचारिक' : 'Professional' },
         { id: 'style_casual', title: isHindi ? 'आसान भाषा' : 'Casual' },
         { id: 'style_practical', title: isHindi ? 'व्यावहारिक' : 'Practical' },
+      ],
+    });
+  }
+
+  private async sendGoalPrompt(learner: any, ctx: FSMContext): Promise<void> {
+    const messaging = await getMessaging();
+    await messaging.sendInteractiveButtons(learner.phone, {
+      body: `Got it! What's your main goal with *${ctx.data.topic}*?`,
+      buttons: [
+        { id: 'goal_beginner', title: 'Complete beginner' },
+        { id: 'goal_refresh', title: 'Quick refresher' },
+        { id: 'goal_practical', title: 'Practical skills' },
       ],
     });
   }
@@ -316,6 +450,12 @@ export class ConversationFSM {
     }
 
     ctx.data.style = resolvedStyle;
+    if (ctx.data.topic) {
+      await this.transitionTo(learner, ctx, 'goal_input', ctx.data);
+      await this.sendGoalPrompt(learner, ctx);
+      return;
+    }
+    // A chat that was already past the language step when this changed still gets asked for a topic.
     await this.transitionTo(learner, ctx, 'topic_input', ctx.data);
 
     const isHindi = ctx.data.language === 'hi';
@@ -333,30 +473,29 @@ export class ConversationFSM {
   ): Promise<void> {
     const messaging = await getMessaging();
 
-    if (!input || input.length < 2) {
+    // `input` is cleaned free text (not the command-normalised form), so Hindi
+    // topics and "C++"/"C#" survive; reject only input with no letters/digits.
+    // A tap on a button from an older message arrives as its id (e.g. "browse_courses"): not a topic.
+    if (!input || input.length < 2 || !normalizeCommand(input) || /^[a-z0-9]+(_[a-z0-9]+)+$/.test(input)) {
       await messaging.sendText(learner.phone, {
         text: "Please type what you'd like to learn. For example: *Python basics*",
       });
       return;
     }
 
+    input = input.slice(0, 200);
     ctx.data.topic = input;
-    await this.transitionTo(learner, ctx, 'goal_input', ctx.data);
-
-    await messaging.sendInteractiveButtons(learner.phone, {
-      body: `Great choice! 📚 *${input}*\n\nWhat's your main goal with this topic?`,
-      buttons: [
-        { id: 'goal_beginner', title: 'Complete beginner' },
-        { id: 'goal_refresh', title: 'Quick refresher' },
-        { id: 'goal_practical', title: 'Practical skills' },
-      ],
-    });
+    // Each new course asks its own style; a style from an earlier course is not carried over.
+    delete ctx.data.style;
+    await this.transitionTo(learner, ctx, 'style_input', ctx.data);
+    await this.sendStylePrompt(learner, ctx);
   }
 
   private async handleGoalInput(
     learner: any,
     ctx: FSMContext,
     input: string,
+    freeText: string = input,
   ): Promise<void> {
     const messaging = await getMessaging();
 
@@ -371,7 +510,7 @@ export class ConversationFSM {
       practical: 'Focus on practical, real-world skills',
     };
 
-    ctx.data.goal = goalMap[input] || input;
+    ctx.data.goal = goalMap[input] || freeText.slice(0, 300) || input;
     await this.transitionTo(learner, ctx, 'confirming', ctx.data);
 
     const { topic, goal, style, language } = ctx.data;
@@ -382,11 +521,12 @@ export class ConversationFSM {
       practical: 'Practical & hands-on',
     };
     const styleLabel = styleLabelMap[style || 'casual'] || style || 'Casual';
+    const micro = process.env.COURSE_SIZE === 'micro';
 
     await messaging.sendInteractiveButtons(learner.phone, {
       body: isHindi
-        ? `✅ *आपका लर्निंग प्लान:*\n\n📌 *विषय:* ${topic}\n🎯 *लक्ष्य:* ${goal}\n✍️ *शैली:* ${styleLabel}\n📚 *5 छोटे पाठ*, हर एक ~3 मिनट\n\nक्या Alfred इसे आपके लिए बनाए?`
-        : `✅ *Here's your learning plan:*\n\n📌 *Topic:* ${topic}\n🎯 *Goal:* ${goal}\n✍️ *Style:* ${styleLabel}\n📚 *5 bite-sized lessons*, each ~3 min\n✨ *Includes:* Explanations, quizzes & flashcards\n\nShall Alfred generate this course for you?`,
+        ? `✅ *आपका लर्निंग प्लान:*\n\n📌 *विषय:* ${topic}\n🎯 *लक्ष्य:* ${goal}\n✍️ *शैली:* ${styleLabel}\n📚 *${micro ? '3 छोटे पाठ' : '5 छोटे पाठ'}*, हर एक ~${micro ? '1' : '3'} मिनट\n\nक्या Alfred इसे आपके लिए बनाए?`
+        : `✅ *Here's your learning plan:*\n\n📌 *Topic:* ${topic}\n🎯 *Goal:* ${goal}\n✍️ *Style:* ${styleLabel}\n📚 *${micro ? '3 bite-sized lessons' : '5 bite-sized lessons'}*, each ~${micro ? '1' : '3'} min\n✨ *Includes:* Explanations, quizzes & flashcards\n\nShall Alfred generate this course for you?`,
       buttons: [
         { id: 'confirm_yes', title: isHindi ? 'हाँ, शुरू करें!' : 'Yes, start!' },
         { id: 'confirm_change', title: isHindi ? 'विषय बदलें' : 'Change topic' },
@@ -409,36 +549,43 @@ export class ConversationFSM {
       return;
     }
 
-    // Confirmed → kick off async course generation
-    await this.transitionTo(learner, ctx, 'generating', ctx.data);
+    // Confirmed → kick off async course generation. The generationId lets the
+    // background job tell whether its result is still wanted when it finishes.
+    const generationId = randomUUID();
+    await this.transitionTo(learner, ctx, 'generating', { ...ctx.data, generationId });
     const firstName = (learner.name || '').split(' ')[0];
     const nameStr = firstName ? `, ${firstName}` : '';
     await messaging.sendText(learner.phone, {
-      text: `🔄 Alfred is generating your personalised *${ctx.data.topic}* course${nameStr}...\n\nThis takes about 30 seconds. I'll message you when it's ready! ✨`,
+      text: `🔄 I'm creating your course with pictures — usually a minute or two. I'll message you here as soon as it's ready. ✨`,
     });
 
     // Generate in background (don't await in the webhook response).
-    // A 90-second hard timeout ensures the learner is never stuck in `generating`
-    // indefinitely if the LLM hangs without throwing.
+    // A hard timeout ensures the learner is never stuck in `generating`
+    // indefinitely if the LLM hangs without throwing. The race does not cancel
+    // the generation — generateCourseAsync checks generationId before applying.
     const withTimeout = <T>(p: Promise<T>, ms: number): Promise<T> => {
-      const timeout = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error(`Course generation timed out after ${ms / 1000}s`)), ms),
-      );
-      return Promise.race([p, timeout]);
+      let timer: NodeJS.Timeout | undefined;
+      const timeout = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`Course generation timed out after ${ms / 1000}s`)), ms);
+      });
+      return Promise.race([p, timeout]).finally(() => clearTimeout(timer));
     };
 
-    withTimeout(this.generateCourseAsync(learner, ctx.data), 90_000).catch(async (err) => {
+    withTimeout(this.generateCourseAsync(learner, ctx.data), GENERATION_TIMEOUT_MS).catch(async (err) => {
       logger.error('Async course generation failed (outer catch):', err);
       try {
         const db = await getDb();
         const messaging = await getMessaging();
         const freshLearner = await db.learners.findById(learner.id);
-        if (freshLearner) {
-          const freshCtx = this.getContext(freshLearner);
-          if (freshCtx.state === 'generating') {
-            await this.transitionTo(freshLearner, freshCtx, 'topic_input', {});
-          }
+        if (!freshLearner) return;
+        const freshCtx = this.getContext(freshLearner);
+        // Only reset + notify if this generation is still the one the learner is
+        // waiting on — they may have restarted or already been told it failed.
+        if (!this.isCurrentGeneration(freshCtx, generationId)) {
+          logger.info(`Generation ${generationId} timed out after learner ${learner.id} moved on — no reset`);
+          return;
         }
+        await this.transitionTo(freshLearner, freshCtx, 'topic_input', {});
         await messaging.sendText(learner.phone, {
           text: `😔 I'm having trouble generating your course right now. Please try again — just type the topic you'd like to learn!`,
         });
@@ -563,58 +710,22 @@ export class ConversationFSM {
       }
     } else if (input === 'restart' || input === 'start over' || input === 'reset') {
       // Reset enrollment to first lesson
-      const allLessons = await db.lessons.findByCourse(enrollment.course_id);
-      const firstLesson = allLessons.find((l: any) => l.content_type !== 'review');
-      if (firstLesson) {
-        await db.enrollments.update(enrollmentId, {
-          currentLessonId: firstLesson.id,
-          progress: 0,
-          status: 'in_progress',
-        });
-        await messaging.sendText(learner.phone, {
-          text: "🔄 Restarting from Day 1, Module 1. Let's go! 🚀",
-        });
-        await delay(2000);
-        const freshEnrollment = await db.enrollments.findById(enrollmentId);
-        if (freshEnrollment) {
-          await courseDelivery.sendNextLesson(learner.phone, freshEnrollment);
-        }
-      }
+      await this.restartEnrollment(learner, ctx, enrollment);
     } else if (input === 'next' || input === 'continue' || input === 'start_day' || input === 'start now' || input === 'next lesson' || input === 'next →' || input === 'next module' || input === '1') {
-      if (enrollment.current_lesson_id) {
-        // If current lesson is a review (day-end comprehension), route to markDayReviewComplete
-        // so the doubt loop fires. Otherwise use the normal markLessonComplete path.
-        const currentLessonForNext = await db.lessons.findById(enrollment.current_lesson_id);
-        if (currentLessonForNext?.content_type === 'review') {
-          await courseDelivery.markDayReviewComplete(enrollment.id, enrollment.current_lesson_id);
-        } else {
-          await courseDelivery.markLessonComplete(enrollment.id, enrollment.current_lesson_id);
-        }
-        // If enrollment is now complete, transition FSM to complete state
-        const refreshed = await db.enrollments.findById(enrollment.id);
-        if (refreshed?.status === 'completed') {
-          await this.transitionTo(learner, ctx, 'complete', {});
-        }
-      } else {
-        await courseDelivery.sendNextLesson(learner.phone, enrollment);
-      }
+      await this.resumeOrAdvance(learner, ctx, enrollment);
     } else if (input.startsWith('quiz_')) {
       await this.handleQuizResponse(learner, enrollment, input, ctx);
     } else if (/^[a-d]$/.test(input)) {
       // Content API quick-reply tap: user picked quiz option A/B/C/D
-      const questions = await db.quiz.findByLesson(enrollment.current_lesson_id);
+      const questions = enrollment.current_lesson_id
+        ? await db.quiz.findByLesson(enrollment.current_lesson_id)
+        : [];
       if (questions.length > 0) {
-        await this.handleQuizResponse(learner, enrollment, `quiz_${questions[0].id}_${input.toUpperCase()}`, ctx);
+        const question = await this.pickAnsweredQuestion(learner, ctx, enrollment, questions);
+        await this.handleQuizResponse(learner, enrollment, `quiz_${question.id}_${input.toUpperCase()}`, ctx);
       } else {
-        if (enrollment.current_lesson_id) {
-          await courseDelivery.markLessonComplete(enrollment.id, enrollment.current_lesson_id);
-          const refreshed = await db.enrollments.findById(enrollment.id);
-          if (refreshed?.status === 'completed') {
-            await this.transitionTo(learner, ctx, 'complete', {});
-          }
-        } else {
-          await courseDelivery.sendNextLesson(learner.phone, enrollment);
-        }
+        // No quiz on this lesson — treat like "next", but never skip an undelivered lesson
+        await this.resumeOrAdvance(learner, ctx, enrollment);
       }
     } else if (input === 'menu' || input === 'courses') {
       await this.transitionTo(learner, ctx, 'idle', {});
@@ -640,17 +751,18 @@ export class ConversationFSM {
     ctx: FSMContext,
     message: IncomingMessage,
     input: string,
+    freeText: string = input,
   ): Promise<void> {
     const db = await getDb();
     const messaging = await getMessaging();
 
     if (input === 'next' || input === 'continue' || input === 'next_lesson' || input === 'next lesson') {
-      // Exit doubt state → resume learning
+      // Exit doubt state → resume learning: deliver the current lesson if it was
+      // never sent, otherwise advance (don't re-send a module already read).
       await this.transitionTo(learner, ctx, 'learning', ctx.data);
       const enrollment = await db.enrollments.findById(ctx.data.enrollmentId!);
       if (enrollment) {
-        const courseDelivery = await this.getCourseDelivery();
-        await courseDelivery.sendNextLesson(learner.phone, enrollment);
+        await this.resumeOrAdvance(learner, ctx, enrollment);
       }
       return;
     }
@@ -664,30 +776,38 @@ export class ConversationFSM {
       return;
     }
 
-    if (!input || input.length < 3) {
-      await messaging.sendText(learner.phone, {
-        text: "Please type your question and I'll help you!",
-      });
-      return;
-    }
-
     // doubt_yes from the loop prompt — just prompt them to type their question
-    if (input === 'doubt_yes' || input === 'yes, another question') {
+    if (
+      input === 'doubt_yes' ||
+      input === 'yes, another question' ||
+      input === 'ask_question' ||
+      input === 'ask another' ||
+      input === 'ask'
+    ) {
       await messaging.sendText(learner.phone, {
         text: "❓ Go ahead — type your question!",
       });
       return;
     }
 
+    if (!freeText || freeText.length < 3 || !input) {
+      await messaging.sendText(learner.phone, {
+        text: "Please type your question and I'll help you!",
+      });
+      return;
+    }
+
     const qaService = await this.getQAService();
     const enrollment = await db.enrollments.findById(ctx.data.enrollmentId!);
-    await qaService.handleTextQuestion(learner, enrollment, input);
+    // The loop prompt below is the only follow-up — QAService's own buttons would compete with it.
+    await qaService.handleTextQuestion(learner, enrollment, freeText, { followUpButtons: false });
 
     // After answering, loop — ask if there are more doubts
     await messaging.sendInteractiveButtons(learner.phone, {
       body: 'Any other doubts? 🤔',
       buttons: [
         { id: 'doubt_yes', title: 'Yes, another question' },
+        { id: 'next', title: 'Continue Course' },
         { id: 'no', title: 'No, all good!' },
       ],
     });
@@ -923,22 +1043,31 @@ export class ConversationFSM {
   private async generateCourseAsync(learner: any, data: FSMData): Promise<void> {
     const db = await getDb();
     const messaging = await getMessaging();
+    const generationId = data.generationId;
 
     try {
       const generator = await this.getGeneratorService();
       const org = await db.organizations.getDefault();
 
-      const course = await generator.generate({
-        topic: data.topic!,
-        goal: data.goal,
-        language: data.language || learner.language || 'en',
-        style: data.style || 'casual',
-        organizationId: org?.id || learner.organization_id,
-      });
+      const course = await generator.generate(courseRequestFor(learner, data, org?.id));
 
       // Enroll the learner
       const lessons = await db.lessons.findByCourse(course.id);
       const firstLesson = lessons[0];
+
+      // The hardcoded engine delivers from lesson rows — a course without any
+      // would leave the learner looping on "Something went wrong loading your lesson".
+      if (lessons.length === 0) {
+        throw new Error(`Course ${course.id} has no lessons — not enrolling`);
+      }
+
+      // The learner may have moved on while we were generating (timeout already
+      // reported, restart, new topic) — never overwrite their newer state.
+      const learnerBeforeEnroll = await db.learners.findById(learner.id);
+      if (!this.isCurrentGeneration(this.getContext(learnerBeforeEnroll), generationId)) {
+        logger.warn(`Discarding late course generation ${generationId} (course ${course.id}) — learner ${learner.id} moved on`);
+        return;
+      }
 
       const enrollment = await db.enrollments.create({
         learnerId: learner.id,
@@ -960,6 +1089,12 @@ export class ConversationFSM {
       // Transition to learning
       const freshLearner = await db.learners.findById(learner.id);
       const freshCtx = this.getContext(freshLearner);
+      if (!this.isCurrentGeneration(freshCtx, generationId)) {
+        // Lost the race while enrolling — don't leave an orphan active enrollment behind.
+        await db.enrollments.update(enrollment.id, { status: 'dropped' });
+        logger.warn(`Discarding late course generation ${generationId} — learner ${learner.id} moved on during enrollment`);
+        return;
+      }
       await this.transitionTo(freshLearner, freshCtx, 'learning', {
         courseId: course.id,
         enrollmentId: enrollment.id,
@@ -969,10 +1104,16 @@ export class ConversationFSM {
         style: data.style,
       });
 
-      // Notify learner
-      await messaging.sendText(learner.phone, {
-        text: `✅ Your course *${course.title}* is ready!\n\nIt has ${lessons.length} lessons. Let's start your first one! 🚀`,
-      });
+      // Notify learner — with the cover picture when one was generated (best-effort)
+      const readyText = `✅ Your course *${course.title}* is ready!\n\nIt has ${lessons.length} lessons. Let's start your first one! 🚀`;
+      const { absoluteMediaUrl } = await import('@ekatra/messaging');
+      const coverUrl = absoluteMediaUrl((await db.courses.findById(course.id).catch(() => null))?.settings?.coverImageUrl);
+      const coverSent = coverUrl
+        ? await messaging.sendImage(learner.phone, { imageUrl: coverUrl, caption: readyText }).catch(() => null)
+        : null;
+      if (!coverSent?.success) {
+        await messaging.sendText(learner.phone, { text: readyText });
+      }
 
       // Send the first lesson immediately — use the enrollment we just created
       const courseDelivery = await this.getDeliveryService();
@@ -981,9 +1122,14 @@ export class ConversationFSM {
     } catch (err: any) {
       logger.error('Background course generation failed:', err);
 
-      // Reset state so the user can try again
+      // Reset state so the user can try again — unless they already moved on
+      // (e.g. the outer timeout already reset and notified them).
       const freshLearner = await db.learners.findById(learner.id);
       const freshCtx = this.getContext(freshLearner);
+      if (!this.isCurrentGeneration(freshCtx, generationId)) {
+        logger.info(`Generation ${generationId} failed after learner ${learner.id} moved on — no reset`);
+        return;
+      }
       await this.transitionTo(freshLearner, freshCtx, 'topic_input', {});
 
       // Give a hint if it's a connectivity problem (helps during dev)
@@ -998,6 +1144,23 @@ export class ConversationFSM {
           : "😔 Sorry, I had trouble generating your course. Please try again — type the topic you want to learn!",
       });
     }
+  }
+
+  // ── M13a learning signals ─────────────────────────────────────────────────
+  // Fully detached fire-and-forget: even a failing dynamic import must never
+  // reach the delivery path (an awaited import rejection would fall through to
+  // the hardcoded-engine catch and re-process the message).
+  private emitLearnerEvent(data: {
+    learnerId: string;
+    courseId?: string | null;
+    nodeId?: string | null;
+    type: string;
+    payload?: any;
+    timezone?: string | null;
+  }): void {
+    import('../services/learnerProfile.js')
+      .then((m) => m.recordLearnerEvent(data))
+      .catch((err) => logger.warn(`learner event emit skipped: ${(err as Error)?.message}`));
   }
 
   // ── Quiz response handler ─────────────────────────────────────────────────
@@ -1030,11 +1193,39 @@ export class ConversationFSM {
     const isCorrect = question.correct_answer === answer;
     await db.quiz.saveResponse({ learnerId: learner.id, questionId, answer, isCorrect });
 
+    // M13a signal — fire-and-forget, never blocks the reply (AC1b).
+    // Only a validated option token is stored, never raw learner text.
+    this.emitLearnerEvent({
+      learnerId: learner.id,
+      courseId: enrollment.course_id ?? null,
+      nodeId: questionId,
+      type: 'quiz_answered',
+      payload: {
+        correct: isCorrect,
+        option_id: /^[A-Z0-9_-]{1,10}$/i.test(answer) ? answer : undefined,
+        lesson_id: enrollment.current_lesson_id,
+      },
+      timezone: learner.timezone,
+    });
+
     const feedback = isCorrect
       ? `✅ *Correct!*\n\n${question.explanation || 'Well done!'}`
       : `❌ *Not quite.* The answer was *${question.correct_answer}*.\n\n${question.explanation || ''}`;
 
     await messaging.sendText(learner.phone, { text: feedback });
+
+    // Day-end review: questions arrive one at a time. After this answer, send the next one
+    // (if any); only after the last does the learner get the continue prompt below.
+    const answeredLesson = await db.lessons.findById(enrollment.current_lesson_id);
+    if (answeredLesson?.content_type === 'review') {
+      const shown = questions.slice(0, 3);
+      const at = shown.findIndex((q: any) => q.id === questionId);
+      if (at >= 0 && at + 1 < shown.length) {
+        await new Promise((resolve) => setTimeout(resolve, REVIEW_NEXT_QUESTION_DELAY_MS));
+        await courseDelivery.sendQuiz(learner.phone, shown[at + 1]);
+        return;
+      }
+    }
 
     // Brief pause then prompt for next module
     await messaging.sendInteractiveButtons(learner.phone, {
@@ -1080,13 +1271,24 @@ export class ConversationFSM {
       return;
     }
 
-    const fsmJson = fsmDef.fsm_json as { states: any[]; transitions: any[] };
+    const fsmJson = fsmDef.fsm_json as { states: any[]; transitions: any[]; startNodeId?: string };
+
+    // Imported authored courses (M12) carry startNodeId and content-bearing nodes —
+    // they run on their own chain-delivery engine, not the one-step editor engine below.
+    if (fsmJson.startNodeId) {
+      await this.processAuthored(learner, enrollment, fsmJson, normalizedInput);
+      return;
+    }
+
     const states: any[] = fsmJson.states ?? [];
     const transitions: any[] = fsmJson.transitions ?? [];
 
-    // Resolve current state — default to the start node
+    // Resolve current state — default to the start node. State saved for another
+    // enrollment/definition, or an end node on a (re-)activated enrollment, restarts.
     const startNode = states.find((s) => s.type === 'start') ?? states[0];
-    const currentStateId: string = learner.metadata?.fsm_dynamic?.state ?? startNode?.id;
+    let savedStateId = resolveDynamicState(learner.metadata?.fsm_dynamic, enrollment);
+    if (savedStateId && states.find((s) => s.id === savedStateId)?.type === 'end') savedStateId = undefined;
+    const currentStateId: string = savedStateId ?? startNode?.id;
 
     if (!currentStateId) {
       logger.error(`Dynamic FSM: no start node in definition ${enrollment.fsm_definition_id}`);
@@ -1103,7 +1305,17 @@ export class ConversationFSM {
 
     if (!transition) {
       logger.info(`Dynamic FSM [${learner.id}]: no transition from "${currentStateId}" on "${normalizedInput}"`);
-      await messaging.sendText(learner.phone, { text: 'Something went wrong. Reply *menu* to continue.' });
+      // Re-prompt with what this step actually accepts instead of a dead-end error.
+      const triggers = [...new Set(
+        transitions
+          .filter((t) => t.from === currentStateId && t.trigger)
+          .map((t) => String(t.trigger)),
+      )];
+      await messaging.sendText(learner.phone, {
+        text: triggers.length > 0
+          ? `Please reply with ${triggers.length === 1 ? '' : 'one of: '}${triggers.map((t) => `*${t}*`).join(', ')}\n\nType *help* for more options.`
+          : 'Type *help* for options.',
+      });
       return;
     }
 
@@ -1138,24 +1350,347 @@ export class ConversationFSM {
     }
 
     // Persist new state using optimistic lock on fsm_dynamic version
-    const currentVersion: number = learner.metadata?.fsm_dynamic?.version ?? 0;
-    const newDynamicCtx = { state: transition.to, version: currentVersion + 1 };
+    const newDynamicCtx = await this.writeDynamicSlot(learner, enrollment, transition.to);
 
-    const updated = await (await getQuery())(
+    if (!newDynamicCtx) {
+      logger.warn(`⚠️  Dynamic FSM optimistic lock conflict for learner ${learner.id} — state update skipped`);
+    } else {
+      logger.info(`⚡ Dynamic FSM [${learner.id}] → ${transition.to} (v${newDynamicCtx.version})`);
+    }
+  }
+
+  /**
+   * Writes learner.metadata.fsm_dynamic for this enrollment under the optimistic
+   * version lock. `stateId: null` clears progress (next message starts over).
+   * Returns the written slot, or null on a lock conflict.
+   */
+  private async writeDynamicSlot(learner: any, enrollment: any, stateId: string | null): Promise<DynamicSlot | null> {
+    const currentVersion: number = learner.metadata?.fsm_dynamic?.version ?? 0;
+    const newCtx: DynamicSlot = {
+      state: stateId,
+      version: currentVersion + 1,
+      enrollmentId: enrollment.id,
+      fsmDefinitionId: enrollment.fsm_definition_id ?? null,
+    };
+    const db = await getDb();
+    const updated = await db.raw(
       `UPDATE learners
        SET metadata = jsonb_set(COALESCE(metadata, '{}'::jsonb), '{fsm_dynamic}', $1::jsonb),
            updated_at = NOW()
        WHERE id = $2
          AND (metadata->'fsm_dynamic'->>'version' IS NULL OR (metadata->'fsm_dynamic'->>'version')::int = $3)
        RETURNING id`,
-      [JSON.stringify(newDynamicCtx), learner.id, currentVersion]
+      [JSON.stringify(newCtx), learner.id, currentVersion]
     );
+    if (!updated?.rows?.length) return null;
+    // Keep the in-memory copy fresh so multi-hop chains in one request don't reuse a stale version.
+    learner.metadata = { ...(learner.metadata ?? {}), fsm_dynamic: newCtx };
+    return newCtx;
+  }
 
-    if (!updated?.rows?.length) {
-      logger.warn(`⚠️  Dynamic FSM optimistic lock conflict for learner ${learner.id} — state update skipped`);
-    } else {
-      logger.info(`⚡ Dynamic FSM [${learner.id}] → ${transition.to} (v${newDynamicCtx.version})`);
+  // ── Authored-course engine (M12) ──────────────────────────────────────────
+  // Imported courses deliver chains of content nodes per learner input: render the
+  // target node, then keep following __auto__ edges (with a natural pause) until a
+  // wait point — a node with buttons, a quiz, or a day_end. State persists at the
+  // wait point via the same optimistic-locked fsm_dynamic slot the M10 engine uses.
+
+  private async processAuthored(
+    learner: any,
+    enrollment: any,
+    fsmJson: { states: any[]; transitions: any[]; startNodeId?: string },
+    normalizedInput: string,
+  ): Promise<void> {
+    const messaging = await getMessaging();
+    const renderer = await import('../services/authoredContentRenderer.js');
+
+    const stateMap = new Map<string, any>((fsmJson.states ?? []).map((s: any) => [s.id, s]));
+    const outgoing = (id: string) => (fsmJson.transitions ?? []).filter((t: any) => t.from === id);
+
+    // Only state saved for THIS enrollment + definition counts — node ids repeat
+    // across compiled courses (e.g. every course ends at 'end_1').
+    const currentId: string | undefined = resolveDynamicState(learner.metadata?.fsm_dynamic, enrollment);
+
+    // First contact, stale state from a re-import/another course, or a finished
+    // course whose enrollment was re-activated: deliver from the start.
+    if (!currentId || !stateMap.has(currentId) || stateMap.get(currentId)?.type === 'end') {
+      await this.deliverAuthoredChain(learner, enrollment, fsmJson.startNodeId!, stateMap, outgoing);
+      return;
     }
+
+    const node = stateMap.get(currentId);
+    const edges = outgoing(currentId);
+
+    if (node.type === 'quiz') {
+      const picked = renderer.matchQuizOption(node, normalizedInput);
+      if (!picked) {
+        await renderer.repromptAuthoredNode(learner.phone, node, edges);
+        return;
+      }
+      const correct = (node.options ?? []).find((o: any) => o.correct);
+      const feedback = picked.correct
+        ? '✅ Correct!'
+        : correct
+          ? `❌ Not quite — the answer is *${correct.label}*`
+          : '👍 Noted!';
+      await messaging.sendText(learner.phone, { text: feedback });
+      logger.info(`📝 Authored quiz [${learner.id}] ${node.id}: picked "${picked.label}" correct=${!!picked.correct}`);
+
+      // M13a signal — persisted at answer time (correctness previously lived only in this log line)
+      this.emitLearnerEvent({
+        learnerId: learner.id,
+        courseId: enrollment.course_id ?? null,
+        nodeId: node.id,
+        type: 'quiz_answered',
+        payload: { correct: !!picked.correct, option_id: String(picked.id ?? picked.label ?? '').slice(0, 64) },
+        timezone: learner.timezone,
+      });
+      if (edges[0]) await this.deliverAuthoredChain(learner, enrollment, edges[0].to, stateMap, outgoing);
+      return;
+    }
+
+    // day_end waits for any input; other nodes need a matching button trigger.
+    const matched =
+      node.type === 'day_end'
+        ? edges[0]
+        : edges.find((t: any) => t.trigger !== renderer.AUTO_TRIGGER && t.trigger === normalizedInput)
+          ?? (edges.length === 1 && edges[0].trigger === renderer.AUTO_TRIGGER ? edges[0] : undefined);
+
+    if (!matched) {
+      await renderer.repromptAuthoredNode(learner.phone, node, edges);
+      return;
+    }
+    await this.deliverAuthoredChain(learner, enrollment, matched.to, stateMap, outgoing);
+  }
+
+  private async deliverAuthoredChain(
+    learner: any,
+    enrollment: any,
+    startId: string,
+    stateMap: Map<string, any>,
+    outgoing: (id: string) => any[],
+  ): Promise<void> {
+    const db = await getDb();
+    const messaging = await getMessaging();
+    const renderer = await import('../services/authoredContentRenderer.js');
+    const delay = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+    let cursor: string | undefined = startId;
+    let rendered = 0;
+    const MAX_CHAIN = 25; // safety valve — longest auto-run in the Design Thinking course is well under this
+
+    while (cursor && rendered < MAX_CHAIN) {
+      const node = stateMap.get(cursor);
+      if (!node) {
+        logger.error(`Authored chain: node "${cursor}" missing`);
+        break;
+      }
+
+      if (node.type === 'end') {
+        await db.enrollments.update(enrollment.id, { status: 'completed' });
+        await messaging.sendText(learner.phone, { text: '🎉 You have completed this course! Well done.' });
+        await this.persistAuthoredState(learner, enrollment, cursor);
+        this.emitLearnerEvent({
+          learnerId: learner.id,
+          courseId: enrollment.course_id ?? null,
+          nodeId: node.id,
+          type: 'course_completed',
+          timezone: learner.timezone,
+        });
+        return;
+      }
+
+      const edges = outgoing(cursor);
+      await renderer.renderAuthoredNode(learner.phone, node, edges);
+      rendered++;
+
+      // M13a signal — reaching a day_end means the learner finished a day's lesson
+      if (node.type === 'day_end') {
+        this.emitLearnerEvent({
+          learnerId: learner.id,
+          courseId: enrollment.course_id ?? null,
+          nodeId: node.id,
+          type: 'lesson_completed',
+          timezone: learner.timezone,
+        });
+      }
+
+      const autoEdge = edges.length === 1 && edges[0].trigger === renderer.AUTO_TRIGGER ? edges[0] : undefined;
+      const isWaitPoint = node.type === 'quiz' || node.type === 'day_end' || !autoEdge;
+      if (isWaitPoint) break;
+
+      cursor = autoEdge.to;
+      await delay(900); // natural reading pace between auto-advanced messages
+    }
+
+    if (rendered >= MAX_CHAIN) {
+      logger.warn(`Authored chain for learner ${learner.id} hit the ${MAX_CHAIN}-node safety cap at "${cursor}"`);
+    }
+    if (cursor) await this.persistAuthoredState(learner, enrollment, cursor);
+  }
+
+  private async persistAuthoredState(learner: any, enrollment: any, stateId: string): Promise<void> {
+    const newCtx = await this.writeDynamicSlot(learner, enrollment, stateId);
+    if (!newCtx) {
+      logger.warn(`⚠️  Authored FSM optimistic lock conflict for learner ${learner.id} — state update skipped`);
+    } else {
+      logger.info(`⚡ Authored FSM [${learner.id}] → ${stateId} (v${newCtx.version})`);
+    }
+  }
+
+  // ── Global commands / resume helpers ──────────────────────────────────────
+
+  /**
+   * help / menu / restart / new topic for learners in a dynamic or authored
+   * course. Returns true when the input was a global command and was handled.
+   */
+  private async handleDynamicGlobalCommand(learner: any, enrollment: any, lower: string): Promise<boolean> {
+    const messaging = await getMessaging();
+
+    if (lower === 'help' || lower === 'menu') {
+      await messaging.sendText(learner.phone, {
+        text:
+          `📋 *Here\'s what you can do:*\n\n` +
+          `• Tap the buttons (or type their text) to move through the course\n` +
+          `• *restart* — start your current course over\n` +
+          `• *new topic* — pick a different topic\n` +
+          `• *help* — show this menu`,
+      });
+      return true;
+    }
+
+    if (RESTART_COMMANDS.has(lower)) {
+      if (!(await this.writeDynamicSlot(learner, enrollment, null))) {
+        logger.warn(`⚠️  Dynamic FSM restart lock conflict for learner ${learner.id}`);
+      }
+      await messaging.sendText(learner.phone, { text: '🔄 Restarting your course from the beginning!' });
+      // Empty input: the authored engine delivers from the start node, the
+      // editor engine re-prompts with the start node's triggers.
+      await this.processDynamic(learner, enrollment, { from: learner.phone, type: 'text', text: '' });
+      return true;
+    }
+
+    if (NEW_TOPIC_COMMANDS.has(lower)) {
+      await this.startNewTopic(learner, this.getContext(learner), enrollment);
+      return true;
+    }
+
+    return false;
+  }
+
+  /** Leaves the active enrollment and asks for a new topic (skips onboarding). */
+  private async startNewTopic(learner: any, ctx: FSMContext, enrollment: any): Promise<void> {
+    const db = await getDb();
+    const messaging = await getMessaging();
+    // 'dropped' takes it out of findActiveByLearner so idle/dynamic routing won't resume it.
+    await db.enrollments.update(enrollment.id, { status: 'dropped' });
+    await this.transitionTo(learner, ctx, 'topic_input', {
+      language: ctx.data?.language ?? learner.language,
+      style: ctx.data?.style,
+    });
+    await messaging.sendText(learner.phone, {
+      text: 'No problem! What topic would you like to learn instead?',
+    });
+  }
+
+  /**
+   * Resets a hardcoded-engine enrollment to Day 1, Module 1 and delivers it.
+   * Returns false when the course has no regular lessons to restart from.
+   */
+  private async restartEnrollment(learner: any, ctx: FSMContext, enrollment: any): Promise<boolean> {
+    const db = await getDb();
+    const messaging = await getMessaging();
+    const courseDelivery = await this.getCourseDelivery();
+
+    const allLessons = await db.lessons.findByCourse(enrollment.course_id);
+    const firstLesson = allLessons.find((l: any) => l.content_type !== 'review');
+    if (!firstLesson) return false;
+
+    await db.enrollments.update(enrollment.id, {
+      currentLessonId: firstLesson.id,
+      progress: 0,
+      status: 'in_progress',
+    });
+    await this.transitionTo(learner, ctx, 'learning', {
+      courseId: enrollment.course_id,
+      enrollmentId: enrollment.id,
+      language: ctx.data?.language,
+      style: ctx.data?.style,
+    });
+    await messaging.sendText(learner.phone, {
+      text: "🔄 Restarting from Day 1, Module 1. Let's go! 🚀",
+    });
+    await delay(2000);
+    const freshEnrollment = await db.enrollments.findById(enrollment.id);
+    if (freshEnrollment) {
+      await courseDelivery.sendNextLesson(learner.phone, freshEnrollment);
+    }
+    return true;
+  }
+
+  /**
+   * "Next"/"Continue": deliver the current lesson if it was never sent (e.g. the
+   * pointer was moved to the next day's first module by the day-end flow),
+   * otherwise complete it and advance. Review lessons keep the day-end path.
+   */
+  private async resumeOrAdvance(learner: any, ctx: FSMContext, enrollment: any): Promise<void> {
+    const db = await getDb();
+    const courseDelivery = await this.getCourseDelivery();
+
+    if (!enrollment.current_lesson_id) {
+      await courseDelivery.sendNextLesson(learner.phone, enrollment);
+      return;
+    }
+
+    // If current lesson is a review (day-end comprehension), route to markDayReviewComplete
+    // so the doubt loop fires. Otherwise use the normal markLessonComplete path.
+    const currentLesson = await db.lessons.findById(enrollment.current_lesson_id);
+    if (currentLesson?.content_type === 'review') {
+      await courseDelivery.markDayReviewComplete(enrollment.id, enrollment.current_lesson_id);
+    } else {
+      const progress = await db.lessonProgress.find(enrollment.id, enrollment.current_lesson_id);
+      if (!progress) {
+        // Never delivered — send it instead of marking it complete unseen.
+        await courseDelivery.sendNextLesson(learner.phone, enrollment);
+        return;
+      }
+      await courseDelivery.markLessonComplete(enrollment.id, enrollment.current_lesson_id);
+    }
+
+    // If enrollment is now complete, transition FSM to complete state
+    const refreshed = await db.enrollments.findById(enrollment.id);
+    if (refreshed?.status === 'completed') {
+      await this.transitionTo(learner, ctx, 'complete', {});
+    }
+  }
+
+  /**
+   * Which question a bare "A"/"B"/"C" reply answers. Regular lessons only ever
+   * show their first question. The day-end review sends up to 3 questions whose
+   * buttons are all just A/B/C, so replies are taken in order and counted per
+   * review lesson in ctx.data.reviewAnswers.
+   */
+  private async pickAnsweredQuestion(learner: any, ctx: FSMContext, enrollment: any, questions: any[]): Promise<any> {
+    if (questions.length === 1) return questions[0];
+    const db = await getDb();
+    const lesson = await db.lessons.findById(enrollment.current_lesson_id);
+    if (lesson?.content_type !== 'review') return questions[0];
+
+    const shown = Math.min(questions.length, 3);
+    const prev = ctx.data.reviewAnswers;
+    const answered = prev && prev.lessonId === enrollment.current_lesson_id ? prev.count : 0;
+    const question = questions[Math.min(answered, shown - 1)];
+    await this.transitionTo(learner, ctx, ctx.state, {
+      ...ctx.data,
+      reviewAnswers: { lessonId: enrollment.current_lesson_id, count: answered + 1 },
+    });
+    return question;
+  }
+
+  /** True while the learner is still waiting on this specific course generation. */
+  private isCurrentGeneration(ctx: FSMContext, generationId: string | undefined): boolean {
+    if (ctx.state !== 'generating') return false;
+    // Generations started before generationId existed only have the state check.
+    return !generationId || ctx.data?.generationId === generationId;
   }
 
   private getContext(learner: any): FSMContext {

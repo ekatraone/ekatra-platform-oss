@@ -22,6 +22,7 @@ export interface Course {
   created: string;
   days?: CourseDay[];
   fsm_definition_id?: string | null;
+  source?: 'authored' | 'ai_generated';
 }
 
 export interface CourseDay {
@@ -34,6 +35,7 @@ export interface CourseDay {
 export interface CourseParagraph {
   id: number;
   content: string;
+  lessonId?: string;
 }
 
 export interface Stat {

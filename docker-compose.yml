@@ -12,7 +12,6 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ekatra_dev_password}
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./packages/database/src/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
     ports:
       - "5432:5432"
     healthcheck:
@@ -36,6 +35,20 @@ services:
       timeout: 5s
       retries: 5
 
+  # Apply schema changes once before either application starts.
+  migrate:
+    build:
+      context: .
+      dockerfile: apps/backend/Dockerfile
+    command: ["node", "node_modules/@ekatra/database/dist/migrate.js"]
+    restart: "no"
+    environment:
+      DATABASE_URL: postgresql://ekatra:${POSTGRES_PASSWORD:-ekatra_dev_password}@postgres:5432/ekatra
+      DATABASE_DISABLE_SSL: "true"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   # Backend API Server
   backend:
     build:
@@ -50,11 +63,17 @@ services:
       DATABASE_DISABLE_SSL: "true"   # Local Docker only — no SSL between containers on same host
       REDIS_URL: redis://redis:6379
       
-      # WhatsApp Cloud API
-      WHATSAPP_PHONE_NUMBER_ID: ${WHATSAPP_PHONE_NUMBER_ID}
-      WHATSAPP_ACCESS_TOKEN: ${WHATSAPP_ACCESS_TOKEN}
-      WHATSAPP_WEBHOOK_VERIFY_TOKEN: ${WHATSAPP_WEBHOOK_VERIFY_TOKEN}
-      WHATSAPP_APP_SECRET: ${WHATSAPP_APP_SECRET}
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:8080}
+      WHATSAPP_PROVIDER: ${WHATSAPP_PROVIDER:-cloudapi}
+      META_PHONE_NUMBER_ID: ${META_PHONE_NUMBER_ID}
+      META_ACCESS_TOKEN: ${META_ACCESS_TOKEN}
+      META_WEBHOOK_VERIFY_TOKEN: ${META_WEBHOOK_VERIFY_TOKEN}
+      META_APP_SECRET: ${META_APP_SECRET}
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:-}
+      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN:-}
+      TWILIO_WHATSAPP_NUMBER: ${TWILIO_WHATSAPP_NUMBER:-}
+      WEBHOOK_BASE_URL: ${WEBHOOK_BASE_URL:-}
       
       # OpenAI
       OPENAI_API_KEY: ${OPENAI_API_KEY}
@@ -66,12 +85,14 @@ services:
     ports:
       - "3000:3000"
     depends_on:
+      migrate:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      test: ["CMD", "wget", "--quiet", "--spider", "http://localhost:3000/health/ready"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -81,16 +102,16 @@ services:
     build:
       context: .
       dockerfile: apps/frontend/Dockerfile
+      args:
+        VITE_API_URL: ${API_URL:-http://localhost:3000}
     container_name: ekatra-frontend
     restart: unless-stopped
-    environment:
-      VITE_API_URL: ${API_URL:-http://localhost:3000}
     ports:
       - "8080:80"
     depends_on:
       - backend
 
-  # Worker for background jobs (optional)
+  # Required production delivery worker
   worker:
     build:
       context: .
@@ -103,9 +124,16 @@ services:
       DATABASE_DISABLE_SSL: "true"   # Local Docker only
       REDIS_URL: redis://redis:6379
       OPENAI_API_KEY: ${OPENAI_API_KEY}
-      WHATSAPP_PHONE_NUMBER_ID: ${WHATSAPP_PHONE_NUMBER_ID}
-      WHATSAPP_ACCESS_TOKEN: ${WHATSAPP_ACCESS_TOKEN}
+      WHATSAPP_PROVIDER: ${WHATSAPP_PROVIDER:-cloudapi}
+      META_PHONE_NUMBER_ID: ${META_PHONE_NUMBER_ID}
+      META_ACCESS_TOKEN: ${META_ACCESS_TOKEN}
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:-}
+      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN:-}
+      TWILIO_WHATSAPP_NUMBER: ${TWILIO_WHATSAPP_NUMBER:-}
+      WEBHOOK_BASE_URL: ${WEBHOOK_BASE_URL:-}
     depends_on:
+      migrate:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
       redis:

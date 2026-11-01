@@ -5,7 +5,8 @@
 
 import { api } from './apiClient';
 
-export type UserRole = 'admin' | 'teacher' | 'student';
+import type { UserRole } from '../lib/types/user';
+export type { UserRole } from '../lib/types/user';
 
 export interface AppUser {
   id: string;

@@ -144,7 +144,7 @@ META_WEBHOOK_VERIFY_TOKEN=your_random_secure_string_12345
 META_APP_SECRET=your_app_secret_here
 
 # Already configured (from working setup):
-AZURE_OPENAI_ENDPOINT=https://aeka-mf7uw5hr-swedencentral.cognitiveservices.azure.com
+AZURE_OPENAI_ENDPOINT=https://<your-resource>.cognitiveservices.azure.com
 AZURE_OPENAI_API_KEY=your_azure_openai_key_here
 AZURE_OPENAI_API_VERSION=2025-01-01-preview
 AZURE_OPENAI_DEPLOYMENT=gpt-4o

@@ -35,9 +35,7 @@ let flashcardReminderQueue: Queue<FlashcardReminderJob> | null = null;
 function getConnection() {
   const redis = getRedis();
   if (!redis) return null;
-  // BullMQ requires its own IORedis connection config object
-  const url = process.env.REDIS_URL!;
-  return { url };
+  return redis;
 }
 
 export function getScheduledPushQueue(): Queue<ScheduledPushJob> | null {

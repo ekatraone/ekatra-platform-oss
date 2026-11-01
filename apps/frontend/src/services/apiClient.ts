@@ -3,25 +3,43 @@
  * Replaces Supabase with our own backend API
  */
 
-// FSM types shared between apiClient and FSMEditor
+import type { ApiResult, CourseRecord, LessonRecord, StatsRecord, MessageRecord } from './contracts';
+
+// FSM types shared between apiClient and FSMEditor.
+// start/lesson/question/end are editor-authored (M10); screen/choice/quiz/day_end
+// come from the authored-course importer (M12) and carry their content inline.
 export interface FSMState {
   id: string;
-  type: 'start' | 'lesson' | 'question' | 'end';
-  label: string;
+  type: 'start' | 'lesson' | 'question' | 'end' | 'screen' | 'choice' | 'quiz' | 'day_end';
+  label?: string;
   data?: Record<string, unknown>;
+  // Authored-course node content (importAuthoredCourse.ts)
+  day?: number;
+  moduleNumber?: number;
+  text?: string;
+  fileUrl?: string;
+  fileName?: string;
+  mediaMissing?: boolean;
+  link?: string;
+  question?: string;
+  options?: { id: string; label: string; correct?: boolean }[];
 }
 
 export interface FSMTransition {
-  id: string;
+  id?: string;
   from: string;
   to: string;
   condition?: string;
   label?: string;
+  /** Authored-course transitions: normalized reply text that fires this edge ('__auto__' = no user input needed) */
+  trigger?: string;
 }
 
 export interface FSMJson {
   states: FSMState[];
   transitions: FSMTransition[];
+  /** Present on imported authored courses — also the marker that makes the editor view-only */
+  startNodeId?: string;
 }
 
 export interface FSMListItem {
@@ -38,7 +56,7 @@ export interface FSMDefinition extends FSMListItem {
   created_by: string | null;
 }
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001';
+const API_URL = import.meta.env?.VITE_API_URL || 'http://localhost:3001';
 const AUTH_STORAGE_KEY = 'ekatra_auth';
 
 class ApiClient {
@@ -90,22 +108,22 @@ class ApiClient {
       Object.entries(params ?? {}).filter(([, v]) => v !== undefined && v !== null)
     );
     const query = new URLSearchParams(defined as any).toString();
-    return this.request(`/api/courses${query ? `?${query}` : ''}`);
+    return this.request<ApiResult<CourseRecord[]>>(`/api/courses${query ? `?${query}` : ''}`);
   }
 
   async getCourse(id: string) {
-    return this.request(`/api/courses/${id}`);
+    return this.request<ApiResult<CourseRecord>>(`/api/courses/${id}`);
   }
 
   async createCourse(data: any) {
-    return this.request('/api/courses', {
+    return this.request<ApiResult<CourseRecord>>('/api/courses', {
       method: 'POST',
       body: JSON.stringify(data),
     });
   }
 
   async updateCourse(id: string, data: any) {
-    return this.request(`/api/courses/${id}`, {
+    return this.request<ApiResult<CourseRecord>>(`/api/courses/${id}`, {
       method: 'PUT',
       body: JSON.stringify(data),
     });
@@ -116,15 +134,15 @@ class ApiClient {
   }
 
   async publishCourse(id: string) {
-    return this.request(`/api/courses/${id}/publish`, { method: 'POST' });
+    return this.request<ApiResult<CourseRecord>>(`/api/courses/${id}/publish`, { method: 'POST' });
   }
 
   async unpublishCourse(id: string) {
     return this.request(`/api/courses/${id}/unpublish`, { method: 'POST' });
   }
 
-  async duplicateCourse(id: string, newTitle: string) {
-    return this.request(`/api/courses/${id}/duplicate`, {
+  async duplicateCourse(id: string, newTitle?: string) {
+    return this.request<ApiResult<CourseRecord>>(`/api/courses/${id}/duplicate`, {
       method: 'POST',
       body: JSON.stringify({ newTitle }),
     });
@@ -132,7 +150,7 @@ class ApiClient {
 
   // Course Lessons (static course content)
   async getLessons(courseId: string) {
-    return this.request(`/api/courses/${courseId}/lessons`);
+    return this.request<ApiResult<LessonRecord[]>>(`/api/courses/${courseId}/lessons`);
   }
 
   async createLesson(courseId: string, data: {
@@ -157,7 +175,7 @@ class ApiClient {
   }
 
   // Learners
-  async getLearners(params?: { courseId?: string; status?: string; search?: string; page?: number }) {
+  async getLearners(params?: { courseId?: string; status?: string; search?: string; page?: number; limit?: number }) {
     const query = new URLSearchParams(params as any).toString();
     return this.request(`/api/learners${query ? `?${query}` : ''}`);
   }
@@ -304,7 +322,7 @@ class ApiClient {
 
   // Analytics & Stats
   async getStats() {
-    return this.request('/api/stats');
+    return this.request<ApiResult<StatsRecord>>('/api/stats');
   }
 
   async getAnalytics() {
@@ -312,7 +330,7 @@ class ApiClient {
   }
 
   async getChatHistory(phone: string) {
-    return this.request(`/api/learners/by-phone/${phone}/messages`);
+    return this.request<ApiResult<MessageRecord[]>>(`/api/learners/by-phone/${encodeURIComponent(phone)}/messages`);
   }
 
   // Health & Stats

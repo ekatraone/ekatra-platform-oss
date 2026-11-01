@@ -2,7 +2,7 @@
 import { UserRole } from "../types/user";
 
 export const validateRole = (role: string): UserRole | null => {
-  const validRoles: UserRole[] = ["admin", "content_creator", "learner"];
+  const validRoles: UserRole[] = ["admin", "super_admin", "viewer"];
   return validRoles.includes(role as UserRole) ? (role as UserRole) : null;
 };
 

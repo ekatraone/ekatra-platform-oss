@@ -16,6 +16,9 @@ importers:
       '@ekatra/database':
         specifier: workspace:*
         version: link:../../packages/database
+      '@ekatra/delivery':
+        specifier: workspace:*
+        version: link:../../packages/delivery
       '@ekatra/messaging':
         specifier: workspace:*
         version: link:../../packages/messaging
@@ -306,6 +309,9 @@ importers:
       tailwindcss:
         specifier: ^3.4.11
         version: 3.4.19(tsx@4.21.0)
+      tsx:
+        specifier: ^4.6.2
+        version: 4.21.0
       typescript:
         specifier: ^5.5.3
         version: 5.9.3
@@ -321,6 +327,9 @@ importers:
       '@ekatra/database':
         specifier: workspace:*
         version: link:../../packages/database
+      '@ekatra/delivery':
+        specifier: workspace:*
+        version: link:../../packages/delivery
       '@ekatra/messaging':
         specifier: workspace:*
         version: link:../../packages/messaging
@@ -367,6 +376,31 @@ importers:
         version: 4.21.0
       typescript:
         specifier: ^5.3.0
+        version: 5.9.3
+
+  packages/delivery:
+    dependencies:
+      '@ekatra/database':
+        specifier: workspace:*
+        version: link:../database
+      '@ekatra/messaging':
+        specifier: workspace:*
+        version: link:../messaging
+      pdfkit:
+        specifier: ^0.18.0
+        version: 0.18.0
+    devDependencies:
+      '@types/node':
+        specifier: ^20.10.0
+        version: 20.19.30
+      '@types/pdfkit':
+        specifier: ^0.17.5
+        version: 0.17.5
+      tsx:
+        specifier: ^4.6.2
+        version: 4.21.0
+      typescript:
+        specifier: ^5.3.2
         version: 5.9.3
 
   packages/messaging:
@@ -2960,6 +2994,7 @@ packages:
   cron-parser@4.9.0:
     resolution: {integrity: sha512-p0SaNjrHOnQeR8/VnfGbmg9te2kfyYSQ7Sc/j/6DtPL3JQvKxmjO9TSjNFpujqV3vEYYBvNNvXSxzyksBWAx1Q==}
     engines: {node: '>=12.0.0'}
+    deprecated: v4 is no longer maintained, upgrade to v5
 
   cross-spawn@7.0.6:
     resolution: {integrity: sha512-uV2QOWP2nWzsy2aMp8aRibhi9dlzF5Hgh5SHaB9OiTGEyDTiJJyx0uy51QXdyWbtAHNua4XJzUKca3OzKUd3vA==}
@@ -3221,6 +3256,7 @@ packages:
   eslint@9.39.2:
     resolution: {integrity: sha512-LEyamqS7W5HB3ujJyvi0HQK/dtVINZvd5mAAp9eT5S/ujByGjiZLCzPcHVzuXbpJDJF/cxwHlfceVUDZ2lnSTw==}
     engines: {node: ^18.18.0 || ^20.9.0 || >=21.1.0}
+    deprecated: This version is no longer supported. Please see https://eslint.org/version-support for other options.
     hasBin: true
     peerDependencies:
       jiti: '*'
@@ -4239,6 +4275,7 @@ packages:
   recharts@2.15.4:
     resolution: {integrity: sha512-UT/q6fwS3c1dHbXv2uFgYJ9BMFHu3fwnd7AYZaEQhXuYQ4hgsxLvsUXzGdKeZrW5xopzDCvuA2N41WJ88I7zIw==}
     engines: {node: '>=14'}
+    deprecated: 1.x and 2.x branches are no longer active. Bump to Recharts v3 to receive latest features and bugfixes. See https://github.com/recharts/recharts/wiki/3.0-migration-guide
     peerDependencies:
       react: ^16.0.0 || ^17.0.0 || ^18.0.0 || ^19.0.0
       react-dom: ^16.0.0 || ^17.0.0 || ^18.0.0 || ^19.0.0
@@ -4574,10 +4611,12 @@ packages:
 
   uuid@8.3.2:
     resolution: {integrity: sha512-+NYs2QeMWy+GWFOEm9xnn6HCDp0l7QBD7ml8zLUmJ+93Q5NF0NocErnwkTkXVFNiX3/fpC6afS8Dhb/gz7R7eg==}
+    deprecated: uuid@10 and below is no longer supported.  For ESM codebases, update to uuid@latest.  For CommonJS codebases, use uuid@11 (but be aware this version will likely be deprecated in 2028).
     hasBin: true
 
   uuid@9.0.1:
     resolution: {integrity: sha512-b+1eJOlsR9K8HJpow9Ok3fiWOWSIcIzXodvv0rQjVoOVNpWMpxf1wZNpt4y9h10odCNrqnYp1OBzRktckBe3sA==}
+    deprecated: uuid@10 and below is no longer supported.  For ESM codebases, update to uuid@latest.  For CommonJS codebases, use uuid@11 (but be aware this version will likely be deprecated in 2028).
     hasBin: true
 
   vary@1.1.2:
@@ -6880,7 +6919,7 @@ snapshots:
 
   '@types/pdfkit@0.17.5':
     dependencies:
-      '@types/node': 22.19.7
+      '@types/node': 20.19.30
 
   '@types/pg-pool@2.0.7':
     dependencies:

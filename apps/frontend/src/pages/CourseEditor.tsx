@@ -26,7 +26,8 @@ const CourseEditorPage = () => {
 
   // Mutation for saving course
   const saveMutation = useMutation({
-    mutationFn: saveCourse,
+    // Only a course loaded from the server is an update; drafts carry a client-side id.
+    mutationFn: (course: Course) => saveCourse(course, { isNew: isNewCourse || !id }),
     onSuccess: (savedCourse) => {
       // Invalidate and refetch
       queryClient.invalidateQueries({ queryKey: ['courses'] });

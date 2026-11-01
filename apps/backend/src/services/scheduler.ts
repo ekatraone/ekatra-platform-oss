@@ -39,6 +39,29 @@ const getTemplates = () => import('@ekatra/messaging').then(m => m.TWILIO_TEMPLA
 const flashcardReminderSentToday = new Set<string>();
 let lastReminderDate = new Date().toDateString();
 
+// Once-per-local-day schedule run keys: Redis SET NX when available,
+// in-memory fallback (single-instance inline mode) otherwise.
+const scheduleRunKeys = new Set<string>();
+
+async function claimScheduleRun(key: string): Promise<boolean> {
+  const redis = getRedis();
+  if (!redis) {
+    if (scheduleRunKeys.has(key)) return false;
+    scheduleRunKeys.add(key);
+    return true;
+  }
+  return (await redis.set(key, '1', 'EX', 48 * 3600, 'NX')) === 'OK';
+}
+
+async function releaseScheduleRun(key: string): Promise<void> {
+  const redis = getRedis();
+  if (!redis) {
+    scheduleRunKeys.delete(key);
+    return;
+  }
+  await redis.del(key);
+}
+
 export class SchedulerService {
   private courseDelivery: any = null;
   private checkInterval: NodeJS.Timeout | null = null;
@@ -84,40 +107,54 @@ export class SchedulerService {
   /**
    * Check all active schedules and execute if it's time
    */
-  private async checkSchedules(): Promise<void> {
-    const db = await getDb();
-    
+  private async checkSchedules(at: Date = new Date()): Promise<void> {
     const now = new Date();
     const currentHour = now.getHours();
     const currentMinute = now.getMinutes();
-    const currentDay = now.getDay(); // 0 = Sunday
 
-    // Get all active schedules
-    const schedules = await db.schedules.findActive();
-
-    for (const schedule of schedules) {
-      try {
-        // Parse schedule time (format: "HH:MM")
-        const [scheduleHour, scheduleMinute] = schedule.send_time.split(':').map(Number);
-        
-        // Check if it's the right time (within 1 minute window)
-        if (currentHour === scheduleHour && currentMinute === scheduleMinute) {
-          // Check if it's the right day
-          const daysOfWeek = schedule.days_of_week || [1, 2, 3, 4, 5]; // Default weekdays
-          if (daysOfWeek.includes(currentDay)) {
-            logger.info(`Executing schedule: ${schedule.name}`);
-            
-            const courseDelivery = await this.getCourseDelivery();
-            await courseDelivery.executeSchedule(schedule.id);
-          }
-        }
-      } catch (error) {
-        logger.error(`Error checking schedule ${schedule.id}:`, error);
-      }
-    }
+    await this.runDueSchedules(at);
 
     // Flashcard review reminders — send once daily at 9:00 AM
     await this.checkFlashcardReminders(currentHour, currentMinute);
+  }
+
+  /**
+   * Run every active schedule whose send_time/days_of_week match `at` in the
+   * schedule's own timezone (tolerant window, not an exact minute), at most
+   * once per schedule per local day.
+   */
+  private async runDueSchedules(at: Date): Promise<void> {
+    const db = await getDb();
+    const { scheduleDueAt, scheduleRunKey } = await import('@ekatra/delivery');
+
+    const schedules = await db.schedules.findActive();
+
+    for (const schedule of schedules) {
+      const due = scheduleDueAt(schedule, at);
+      if (!due) continue;
+
+      const runKey = scheduleRunKey(schedule.id, due.localDate);
+      try {
+        if (!(await claimScheduleRun(runKey))) {
+          logger.info(`Schedule "${schedule.name}" already ran for ${due.localDate} — skipping`);
+          continue;
+        }
+      } catch (error) {
+        logger.error(`Unable to claim run for schedule ${schedule.id}:`, error);
+        continue;
+      }
+
+      try {
+        logger.info(`Executing schedule: ${schedule.name}`);
+        const courseDelivery = await this.getCourseDelivery();
+        const result = await courseDelivery.executeSchedule(schedule.id);
+        logger.info(`Schedule "${schedule.name}" done — sent=${result.sent} failed=${result.failed}`);
+      } catch (error) {
+        // Nothing was confirmed sent — free the day's key so the next check retries.
+        await releaseScheduleRun(runKey).catch(() => {});
+        logger.error(`Error executing schedule ${schedule.id}:`, error);
+      }
+    }
   }
 
   /**
@@ -151,6 +188,7 @@ export class SchedulerService {
       const db = await getDb();
       const messaging = await getMessaging();
       const TEMPLATES = await getTemplates();
+      const { isAppOnlyRecipient } = await import('@ekatra/messaging');
 
       // Find all active learners
       const { data: learners } = await db.learners.findAll({ status: 'active', limit: 500 });
@@ -162,6 +200,8 @@ export class SchedulerService {
       const redis = getRedis();
 
       for (const learner of learners) {
+        // App-only learners ("fb:<uid>") have no WhatsApp/Telegram channel to remind.
+        if (isAppOnlyRecipient(learner.phone)) continue;
         // Per-learner dedup: Redis-backed when available, in-memory fallback
         const perLearnerKey = `reminded:${today}:${learner.id}`;
         if (redis) {
@@ -194,6 +234,9 @@ export class SchedulerService {
               '3': 'flashcard review',
             },
           ));
+
+          // No channel for this learner: a permanent skip, never retried, queued or alerted on.
+          if (result.permanent) continue;
 
           // Fall back to interactive buttons if template fails (e.g. non-Twilio provider)
           if (!result.success) {
@@ -255,27 +298,19 @@ export class SchedulerService {
   }
 
   /**
-   * Execute all active schedules (inline fallback when BullMQ is unavailable).
+   * Execute the schedules due now (inline fallback when BullMQ is unavailable).
+   * Honours send_time/days_of_week/timezone and the once-per-day run key.
    */
-  async executeScheduledPushes(): Promise<void> {
-    const db = await getDb();
-    const schedules = await db.schedules.findActive();
-    for (const schedule of schedules) {
-      try {
-        const courseDelivery = await this.getCourseDelivery();
-        const result = await courseDelivery.executeSchedule(schedule.id);
-        logger.info(`Schedule "${schedule.name}" done — sent=${result.sent} failed=${result.failed}`);
-      } catch (err) {
-        logger.error(`Schedule "${schedule.id}" failed:`, err);
-      }
-    }
+  async executeScheduledPushes(at: Date = new Date()): Promise<void> {
+    await this.runDueSchedules(at);
   }
 
   /**
    * Check and execute time-matched custom schedules (inline fallback).
+   * @param at  The cron tick's fire time (defaults to now).
    */
-  async checkCustomSchedules(): Promise<void> {
-    await this.checkSchedules();
+  async checkCustomSchedules(at: Date = new Date()): Promise<void> {
+    await this.checkSchedules(at);
   }
 
   /**

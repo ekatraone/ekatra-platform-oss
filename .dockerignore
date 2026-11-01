@@ -5,6 +5,8 @@ dist
 **/dist
 .env
 **/.env
+**/.env.*
+!**/.env.example
 .git
 *.log
 /tmp

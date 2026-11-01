@@ -5,8 +5,10 @@
  * then persists it into the database (courses + lessons + quiz_questions tables).
  */
 
-import { llmChat } from '../lib/llm.js';
+import { llmChat, llmSource } from '../lib/llm.js';
 import { logger } from '../lib/logger.js';
+import { metaModelClient, metaModelId } from '../lib/metaModelClient.js';
+import { generateCourseImages, imageBudgetMs, publicBaseUrl, ImageJob } from './courseImages.js';
 
 const getDb = () => import('@ekatra/database').then((m) => m.db);
 
@@ -20,6 +22,17 @@ export interface CourseGenerationParams {
   numDays?: number;    // default 3, max 5
   numModules?: number; // modules per day, default 3, max 5
   organizationId: string;
+  /**
+   * Set when the course is generated FOR a learner (the sync lesson request, the WhatsApp chat flow).
+   * Admin or API generation leaves it unset. Account deletion removes only courses carrying this stamp.
+   */
+  requestedByLearnerId?: string;
+  /** 'micro' = 1 day × 3 short modules; defaults to COURSE_SIZE env or 'standard'. */
+  size?: 'micro' | 'standard';
+  /** Force a provider (e.g. 'meta' for Muse) instead of the llmChat fallback chain. */
+  provider?: 'meta';
+  /** Skip the existing-course reuse check and always generate. */
+  force?: boolean;
 }
 
 interface GeneratedQuiz {
@@ -33,6 +46,7 @@ interface GeneratedModule {
   title: string;
   content: string;
   quiz: GeneratedQuiz;
+  imagePrompt?: string;
 }
 
 interface GeneratedDay {
@@ -44,7 +58,67 @@ interface GeneratedDay {
 interface GeneratedCourse {
   title: string;
   description: string;
+  coverImagePrompt?: string;
+  /** Provider and model that actually produced the text; stamped into settings.generator. */
+  generator?: { provider: string; model: string };
   days: GeneratedDay[];
+}
+
+export type CourseSize = 'micro' | 'standard';
+
+/**
+ * Settings stored on a generated course. Every AI course records what produced it
+ * (the phone only downloads courses that have a generator): the provider and model that
+ * actually answered, or the forced provider when the answer carried no attribution.
+ */
+export function buildCourseSettings(
+  courseData: { days: unknown[]; generator?: { provider: string; model: string } },
+  language: string,
+  size: CourseSize,
+  provider?: 'meta',
+  requestedByLearnerId?: string,
+) {
+  return {
+    language,
+    aiGenerated: true,
+    totalDays: courseData.days.length,
+    size,
+    ...(requestedByLearnerId ? { requestedByLearnerId } : {}),
+    ...(courseData.generator
+      ? { generator: courseData.generator }
+      : provider === 'meta'
+        ? { generator: { provider: 'meta', model: metaModelId() } }
+        : {}),
+  };
+}
+
+export function resolveCourseSize(size?: CourseSize): CourseSize {
+  if (size) return size;
+  return process.env.COURSE_SIZE === 'micro' ? 'micro' : 'standard';
+}
+
+// ── Dedup matching ─────────────────────────────────────────────────────────
+
+const slugify = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+
+/**
+ * Whether an existing published course can be handed to a learner who asked
+ * for `topic` in `language`. Only AI-generated, lesson-backed courses in the
+ * same language qualify — authored (FSM-delivered) courses have no lesson rows
+ * and an English course is no answer to a Hindi request.
+ */
+export function isReusableCourse(course: any, topic: string, language: string): boolean {
+  if (!course?.title) return false;
+  if (course.source === 'authored' || course.fsm_definition_id) return false;
+  if (!course.settings?.aiGenerated) return false;
+  if ((course.settings?.language ?? 'en') !== (language || 'en')) return false;
+
+  // Match if the slugs share 80%+ of their words
+  const topicWords = new Set(slugify(topic).split('-').filter((w: string) => w.length > 3));
+  const courseWords = slugify(course.title).split('-').filter((w: string) => w.length > 3);
+  if (topicWords.size === 0) return false;
+  const overlap = courseWords.filter((w: string) => topicWords.has(w)).length;
+  return overlap / topicWords.size >= 0.8;
 }
 
 // ── Service ────────────────────────────────────────────────────────────────
@@ -61,22 +135,30 @@ export class CourseGeneratorService {
       goal,
       language = 'en',
       style = 'conversational',
-      numDays = Math.min(Math.max(params.numDays ?? 3, 3), 5),
-      numModules = Math.min(Math.max(params.numModules ?? 3, 3), 5),
       organizationId,
+      provider,
+      force = false,
+      requestedByLearnerId,
     } = params;
+    const size = resolveCourseSize(params.size);
+    // The 3-minimum clamp applies only to standard courses.
+    const numDays = size === 'micro' ? 1 : Math.min(Math.max(params.numDays ?? 3, 3), 5);
+    const numModules = size === 'micro' ? 3 : Math.min(Math.max(params.numModules ?? 3, 3), 5);
 
     // ── Deduplication: check for existing published course ─────────────────
-    const existing = await this.findExistingCourse(topic, organizationId);
-    if (existing) {
-      logger.info(`♻️  Reusing existing course "${existing.title}" (${existing.id}) for topic "${topic}"`);
-      return existing;
+    if (!force) {
+      const existing = await this.findExistingCourse(topic, organizationId, language);
+      if (existing) {
+        logger.info(`♻️  Reusing existing course "${existing.title}" (${existing.id}) for topic "${topic}"`);
+        return existing;
+      }
     }
 
-    logger.info(`🎓 Generating course: "${topic}" (${numDays} days × ${numModules} modules, lang=${language})`);
+    const started = Date.now();
+    logger.info(`🎓 Generating ${size} course: "${topic}" (${numDays} days × ${numModules} modules, lang=${language})`);
 
-    const courseData = await this.callLLM(topic, goal, language, style, numDays, numModules);
-    const course = await this.saveToDB(courseData, organizationId, language);
+    const courseData = await this.callLLM(topic, goal, language, style, numDays, numModules, size, provider);
+    const course = await this.saveToDB(courseData, organizationId, language, size, provider, started, requestedByLearnerId);
 
     logger.info(`✅ Course saved: ${course.id} — "${course.title}"`);
     return course;
@@ -86,26 +168,17 @@ export class CourseGeneratorService {
 
   /**
    * Slug-based dedup: normalise topic → check against existing course titles.
-   * Returns the first matching published course, or null.
+   * Returns the first matching reusable published course, or null.
    */
-  private async findExistingCourse(topic: string, organizationId: string): Promise<any> {
+  private async findExistingCourse(topic: string, organizationId: string, language: string): Promise<any> {
     try {
       const db = await getDb();
-      const slug = topic.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
       const { data: courses } = await db.courses.findAll({
         organizationId,
         status: 'published',
         limit: 50,
       });
-      return courses.find((c: any) => {
-        const courseSlug = c.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
-        // Match if the slugs share 80%+ of their words
-        const topicWords = new Set(slug.split('-').filter((w: string) => w.length > 3));
-        const courseWords = courseSlug.split('-').filter((w: string) => w.length > 3);
-        if (topicWords.size === 0) return false;
-        const overlap = courseWords.filter((w: string) => topicWords.has(w)).length;
-        return overlap / topicWords.size >= 0.8;
-      }) ?? null;
+      return courses.find((c: any) => isReusableCourse(c, topic, language)) ?? null;
     } catch {
       return null; // dedup failure should never block generation
     }
@@ -118,7 +191,12 @@ export class CourseGeneratorService {
     style: string,
     numDays: number,
     numModules: number,
+    size: CourseSize,
+    provider?: 'meta',
   ): Promise<GeneratedCourse> {
+    const micro = size === 'micro';
+    const reviewCount = micro ? 2 : 3;
+    const wordRange = micro ? '80-120 words' : '150-200 words';
     const goalLine = goal ? `\nLearner's goal: ${goal}` : '';
     const langLine = language !== 'en' ? `\nRespond entirely in language code: ${language}` : '';
 
@@ -129,8 +207,9 @@ Rules:
 - Use simple, conversational language. Avoid jargon.
 - Use \\n\\n to separate paragraphs within module content.
 - Each module MUST have exactly ONE quiz question (4 options, one correct answer A/B/C/D).
-- Each day MUST have exactly 3 comprehension questions that test understanding across all modules that day.
+- Each day MUST have exactly ${reviewCount} comprehension questions that test understanding across all modules that day.
 - NO flashcards — do not include any flashcard fields.
+- Give the course a "coverImagePrompt" and every module an "imagePrompt": one plain sentence describing a simple illustration of the idea (objects and scenes only; the image must contain no words, letters or numbers).
 - Respond ONLY with valid JSON. No markdown fences, no commentary.${langLine}`;
 
     const userPrompt = `Create a ${numDays}-day micro-course about: "${topic}"${goalLine}
@@ -141,13 +220,15 @@ Return this exact JSON structure:
 {
   "title": "Course title (max 60 characters)",
   "description": "What learners will gain (2-3 sentences)",
+  "coverImagePrompt": "One sentence describing a cover illustration for the whole course.",
   "days": [
     {
       "dayNumber": 1,
       "modules": [
         {
           "title": "Module title (max 60 characters)",
-          "content": "Module body (150-200 words). Use \\n\\n for paragraphs. Use *bold* for key terms.",
+          "content": "Module body (${wordRange}). Use \\n\\n for paragraphs. Use *bold* for key terms.",
+          "imagePrompt": "One sentence describing an illustration for this module.",
           "quiz": {
             "question": "Question testing understanding of this module?",
             "options": ["Option A text", "Option B text", "Option C text", "Option D text"],
@@ -168,7 +249,7 @@ Return this exact JSON structure:
   ]
 }
 
-Ensure comprehensionQuestions has exactly 3 items per day.`;
+Ensure comprehensionQuestions has exactly ${reviewCount} items per day.`;
 
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
@@ -178,6 +259,7 @@ Ensure comprehensionQuestions has exactly 3 items per day.`;
             { role: 'user', content: userPrompt },
           ],
           temperature: 0.7,
+          ...(provider ? { provider } : {}),
           // Reasoning models spend part of this on hidden reasoning before emitting
           // the course JSON — 4000 truncates mid-output for 3+ day courses.
           maxTokens: 8000,
@@ -192,6 +274,9 @@ Ensure comprehensionQuestions has exactly 3 items per day.`;
           throw new Error('LLM returned invalid course structure');
         }
 
+        const source = llmSource(completion);
+        if (source) parsed.generator = { provider: source.provider, model: source.model };
+
         const totalModules = parsed.days.reduce((sum, d) => sum + (d.modules?.length ?? 0), 0);
         logger.info(`📝 LLM generated ${parsed.days.length} days / ${totalModules} modules for "${parsed.title}"`);
         return parsed;
@@ -205,10 +290,35 @@ Ensure comprehensionQuestions has exactly 3 items per day.`;
     throw new Error('Course generation failed after 3 attempts');
   }
 
+  /** Best-effort: never throws, so a lesson is never lost to an image problem. */
+  private async attachImages(db: any, courseId: string, jobs: ImageJob[], startedAt: number): Promise<void> {
+    if (!jobs.length || process.env.COURSE_IMAGES === 'off' || !metaModelClient.isAvailable()) return;
+    try {
+      const baseUrl = publicBaseUrl();
+      if (!baseUrl) {
+        logger.warn('Skipping course images: set PUBLIC_BASE_URL (or WEBHOOK_BASE_URL, https in production) so image links resolve');
+        return;
+      }
+      const imagesStarted = Date.now();
+      const result = await generateCourseImages(courseId, jobs, {
+        db,
+        createImage: (prompt) => metaModelClient.createImage(prompt),
+        budgetMs: imageBudgetMs(imagesStarted - startedAt),
+      });
+      logger.info(`🖼️  Images for course ${courseId}: ${result.stored} stored, ${result.failed} failed in ${Date.now() - imagesStarted}ms`);
+    } catch (err: any) {
+      logger.warn(`Image generation skipped for course ${courseId}: ${err?.message}`);
+    }
+  }
+
   private async saveToDB(
     courseData: GeneratedCourse,
     organizationId: string,
     language: string,
+    size: CourseSize,
+    provider?: 'meta',
+    startedAt: number = Date.now(),
+    requestedByLearnerId?: string,
   ): Promise<any> {
     const db = await getDb();
 
@@ -218,10 +328,14 @@ Ensure comprehensionQuestions has exactly 3 items per day.`;
       title: courseData.title,
       description: courseData.description,
       status: 'published',
-      settings: { language, aiGenerated: true, totalDays: courseData.days.length },
+      settings: buildCourseSettings(courseData, language, size, provider, requestedByLearnerId),
     });
 
     // 2. Flatten days → modules, save each as a lesson row with day_number
+    const imageJobs: ImageJob[] = [];
+    if (courseData.coverImagePrompt) {
+      imageJobs.push({ kind: 'cover', lessonId: null, prompt: courseData.coverImagePrompt });
+    }
     let sequenceOrder = 1;
     for (const day of courseData.days) {
       for (const moduleData of day.modules) {
@@ -234,6 +348,10 @@ Ensure comprehensionQuestions has exactly 3 items per day.`;
           durationMinutes: 3,
           dayNumber: day.dayNumber,
         });
+
+        if (moduleData.imagePrompt) {
+          imageJobs.push({ kind: 'module', lessonId: lesson.id, prompt: moduleData.imagePrompt });
+        }
 
         if (moduleData.quiz) {
           const q = moduleData.quiz;
@@ -284,6 +402,7 @@ Ensure comprehensionQuestions has exactly 3 items per day.`;
     const totalModules = courseData.days.reduce((sum, d) => sum + d.modules.length, 0);
     logger.info(`✅ Saved ${courseData.days.length} days / ${totalModules} modules for course ${course.id}`);
 
+    await this.attachImages(db, course.id, imageJobs, startedAt);
     return course;
   }
 }

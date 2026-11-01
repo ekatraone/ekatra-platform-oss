@@ -5,12 +5,16 @@
  */
 
 import { Router, Request, Response } from 'express';
-import { createHmac } from 'crypto';
+import { requireWebhookProvider, verifyMetaSignature, verifySharedSecret } from '../middleware/webhookSecurity.js';
 import twilio from 'twilio';
-import { MessageHandler } from '../services/messageHandler.js';
+import { LearnerBusyError, MessageHandler } from '../services/messageHandler.js';
 import { logger } from '../lib/logger.js';
 import { markdownToWhatsApp } from '../lib/whatsappFormatter.js';
-import { markWebhookSeen } from '../lib/redis.js';
+import {
+  extractCloudApiReceiptEvents,
+  processCloudApiReceiptEvent,
+  type CloudApiReceiptEvent,
+} from '../services/cloudApiReceipts.js';
 
 export { markdownToWhatsApp }; // re-export for service use
 
@@ -24,14 +28,14 @@ const getDb = () => import('@ekatra/database').then(m => m.db);
  * Webhook verification (GET)
  * Meta sends this to verify the webhook URL
  */
-webhookRouter.get('/whatsapp', (req: Request, res: Response) => {
+webhookRouter.get('/whatsapp', requireWebhookProvider('cloudapi'), (req: Request, res: Response) => {
   const mode = req.query['hub.mode'] as string;
   const token = req.query['hub.verify_token'] as string;
   const challenge = req.query['hub.challenge'] as string;
 
-  logger.info(`Webhook verification attempt: mode=${mode}, token=${token?.substring(0, 10)}...`);
+  logger.info('Webhook verification attempt');
 
-  if (mode === 'subscribe' && token === process.env.META_WEBHOOK_VERIFY_TOKEN) {
+  if (mode === 'subscribe' && typeof challenge === 'string' && verifySharedSecret(token, process.env.META_WEBHOOK_VERIFY_TOKEN)) {
     logger.info('✅ Webhook verified');
     return res.status(200).send(challenge);
   }
@@ -47,7 +51,8 @@ webhookRouter.get('/whatsapp', (req: Request, res: Response) => {
  */
 webhookRouter.post('/telegram', async (req: Request, res: Response) => {
   const expected = process.env.TELEGRAM_WEBHOOK_SECRET;
-  if (expected && req.headers['x-telegram-bot-api-secret-token'] !== expected) {
+  if (!process.env.TELEGRAM_BOT_TOKEN || process.env.TELEGRAM_POLLING === 'true') return res.sendStatus(404);
+  if (!verifySharedSecret(req.headers['x-telegram-bot-api-secret-token'], expected)) {
     logger.error('Invalid Telegram webhook secret');
     return res.sendStatus(401);
   }
@@ -66,22 +71,58 @@ webhookRouter.post('/telegram', async (req: Request, res: Response) => {
  * Incoming messages (POST)
  * Meta sends messages here
  */
-webhookRouter.post('/whatsapp', async (req: Request, res: Response) => {
+webhookRouter.post('/whatsapp', requireWebhookProvider('cloudapi'), async (req: Request, res: Response) => {
   // Verify signature
   const signature = req.headers['x-hub-signature-256'] as string;
-  if (process.env.META_APP_SECRET && !verifySignature(req.body, signature)) {
+  if (!verifyMetaSignature(req.rawBody, signature, process.env.META_APP_SECRET)) {
     logger.error('Invalid webhook signature');
     return res.sendStatus(401);
   }
 
-  // Respond immediately (Meta requires response within 20 seconds)
+  // Persist and claim each provider event before acknowledging the batch. If the
+  // database is unavailable, return 503 so Meta retries instead of losing it.
+  const events = extractCloudApiReceiptEvents(req.body);
+  const claimed: Array<{ receiptId: string; event: CloudApiReceiptEvent }> = [];
+  try {
+    const db = await getDb();
+    for (const event of events) {
+      const receipt = await db.webhookReceipts.receiveAndClaim({
+        provider: 'cloudapi',
+        externalEventId: event.externalEventId,
+        eventType: event.eventType,
+        payload: { payload: event.payload, context: event.context },
+      });
+      if (receipt.claimed) claimed.push({ receiptId: receipt.id, event });
+    }
+  } catch (error) {
+    logger.error('Unable to persist webhook receipt:', error);
+    return res.sendStatus(503);
+  }
+
   res.sendStatus(200);
 
-  // Process asynchronously
-  try {
-    await processWebhook(req.body);
-  } catch (error) {
-    logger.error('Error processing webhook:', error);
+  // Process after acknowledgment. processCloudApiReceiptEvent rejects when the
+  // event was not handled (error, or learner lock busy), so only real success is
+  // marked processed; anything else stays durable and claimable by a provider
+  // retry or the recovery worker.
+  for (const item of claimed) {
+    try {
+      await processCloudApiReceiptEvent(item.event, messageHandler);
+      const db = await getDb();
+      await db.webhookReceipts.markProcessed(item.receiptId);
+    } catch (error) {
+      if (error instanceof LearnerBusyError) {
+        logger.warn(`Webhook receipt ${item.receiptId} deferred: ${error.message}`);
+      } else {
+        logger.error(`Error processing webhook receipt ${item.receiptId}:`, error);
+      }
+      try {
+        const db = await getDb();
+        await db.webhookReceipts.markFailed(item.receiptId, error);
+      } catch (markError) {
+        logger.error(`Unable to mark webhook receipt ${item.receiptId} failed:`, markError);
+      }
+    }
   }
 });
 
@@ -89,6 +130,8 @@ webhookRouter.post('/whatsapp', async (req: Request, res: Response) => {
  * WATI-style webhook (for backward compatibility during migration)
  */
 webhookRouter.post('/wati', async (req: Request, res: Response) => {
+  if (!process.env.WATI_WEBHOOK_SECRET) return res.sendStatus(404);
+  if (!verifySharedSecret(req.headers['x-webhook-secret'], process.env.WATI_WEBHOOK_SECRET)) return res.sendStatus(401);
   try {
     const { waId, text, senderName, type, listReply, button } = req.body;
     
@@ -115,54 +158,6 @@ webhookRouter.post('/wati', async (req: Request, res: Response) => {
 });
 
 /**
- * Process Cloud API webhook payload
- */
-async function processWebhook(body: any): Promise<void> {
-  if (body.object !== 'whatsapp_business_account') {
-    return;
-  }
-
-  for (const entry of body.entry || []) {
-    for (const change of entry.changes || []) {
-      if (change.field !== 'messages') continue;
-
-      const value = change.value;
-
-      // Process incoming messages
-      for (const message of value.messages || []) {
-        // Idempotency check — WhatsApp retries webhooks; skip already-processed messages
-        if (message.id) {
-          const isNew = await markWebhookSeen(message.id);
-          if (!isNew) {
-            logger.info(`⏭️  Skipping duplicate webhook message ${message.id}`);
-            continue;
-          }
-        }
-
-        const contact = value.contacts?.find((c: any) => c.wa_id === message.from);
-
-        await messageHandler.handle({
-          from: message.from,
-          name: contact?.profile?.name,
-          timestamp: message.timestamp,
-          type: message.type,
-          text: message.text?.body,
-          mediaId: message.image?.id || message.document?.id || message.audio?.id || message.video?.id,
-          buttonPayload: message.button?.payload,
-          listReplyId: message.interactive?.list_reply?.id,
-          buttonReplyId: message.interactive?.button_reply?.id
-        });
-      }
-
-      // Process status updates
-      for (const status of value.statuses || []) {
-        await processStatusUpdate(status);
-      }
-    }
-  }
-}
-
-/**
  * Process message status updates (delivered, read, failed, undelivered, sent, queued, etc.)
  * Called from both the Cloud API webhook and the Twilio webhook handler.
  *
@@ -177,39 +172,18 @@ async function processStatusUpdate(status: {
   timestamp?: string;
   metadata?: Record<string, any>;
 }): Promise<void> {
-  try {
-    let ts: Date;
-    if (status.timestamp) {
-      // Cloud API sends unix epoch; Twilio sends ISO or RFC2822 string
-      const asNum = parseInt(status.timestamp, 10);
-      ts = isNaN(asNum) ? new Date(status.timestamp) : new Date(asNum * 1000);
-    } else {
-      ts = new Date();
-    }
-    const db = await getDb();
-    await db.messageLog.updateStatus(status.id, status.status, ts, status.metadata);
-  } catch (error) {
-    logger.error('Error processing status update:', error);
+  let ts: Date;
+  if (status.timestamp) {
+    // Cloud API sends unix epoch; Twilio sends ISO or RFC2822 string
+    const asNum = parseInt(status.timestamp, 10);
+    ts = isNaN(asNum) ? new Date(status.timestamp) : new Date(asNum * 1000);
+  } else {
+    ts = new Date();
   }
+  const db = await getDb();
+  await db.messageLog.updateStatus(status.id, status.status, ts, status.metadata);
 }
 
-/**
- * Verify webhook signature
- */
-function verifySignature(body: any, signature: string): boolean {
-  if (!process.env.META_APP_SECRET) {
-    // In production META_APP_SECRET must be set; log a warning so it surfaces
-    logger.warn('META_APP_SECRET not configured — webhook signature verification is SKIPPED');
-    return true;
-  }
-  if (!signature) return false;
-
-  const expectedSignature = createHmac('sha256', process.env.META_APP_SECRET)
-    .update(JSON.stringify(body))
-    .digest('hex');
-
-  return `sha256=${expectedSignature}` === signature;
-}
 
 // Export webhook router (already exported as const above)
 
@@ -229,7 +203,8 @@ function verifySignature(body: any, signature: string): boolean {
  *    ChannelStatusMessage=<WhatsApp error string> (if failed)
  *    EventType=READ (WhatsApp read receipt, same as status=read)
  */
-webhookRouter.post('/twilio', async (req: Request, res: Response) => {
+webhookRouter.post('/twilio', requireWebhookProvider('twilio'), async (req: Request, res: Response) => {
+  if (!process.env.TWILIO_AUTH_TOKEN) return res.sendStatus(401);
   // Validate Twilio signature using official SDK
   if (process.env.TWILIO_AUTH_TOKEN) {
     const twilioSig = req.headers['x-twilio-signature'] as string;
@@ -296,5 +271,3 @@ webhookRouter.post('/twilio', async (req: Request, res: Response) => {
     logger.error('Error processing Twilio webhook:', err);
   }
 });
-
-

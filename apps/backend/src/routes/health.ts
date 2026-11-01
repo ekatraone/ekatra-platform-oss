@@ -6,6 +6,8 @@
 
 import { Router, Request, Response } from 'express';
 import { logger } from '../lib/logger.js';
+import { authMiddleware, requireRole } from '../middleware/auth.js';
+import rateLimit from 'express-rate-limit';
 
 export const healthRouter: Router = Router();
 
@@ -28,86 +30,21 @@ healthRouter.get('/', async (_req: Request, res: Response) => {
  * Readiness probe - checks all dependencies
  */
 healthRouter.get('/ready', async (_req: Request, res: Response) => {
-  const checks: Record<string, { status: string; latency?: number; error?: string }> = {};
-
-  // Check database (lazy import)
-  try {
-    const { db } = await import('@ekatra/database');
-    const start = Date.now();
-    await db.raw('SELECT 1');
-    checks.database = { status: 'healthy', latency: Date.now() - start };
-  } catch (error: any) {
-    checks.database = { status: 'unavailable', error: error.message };
-  }
-
-  // Redis check removed - not used in current setup
-
-  // Check Twilio (if configured)
-  if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
-    try {
-      const start = Date.now();
-      const sid = process.env.TWILIO_ACCOUNT_SID;
-      const token = process.env.TWILIO_AUTH_TOKEN;
-      const auth = Buffer.from(`${sid}:${token}`).toString('base64');
-      const res = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${sid}.json`, {
-        headers: { Authorization: `Basic ${auth}` },
-        signal: AbortSignal.timeout(5000),
-      });
-      checks.twilio = {
-        status: res.ok ? 'healthy' : 'unavailable',
-        latency: Date.now() - start,
-        ...(res.ok ? {} : { error: `HTTP ${res.status}` }),
-      };
-    } catch (error: any) {
-      checks.twilio = { status: 'unavailable', error: error.message };
-    }
-  } else {
-    checks.twilio = { status: 'unavailable', error: 'TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN not set' };
-  }
-
-  // Check Azure AI Foundry (if configured)
-  if (process.env.AZURE_ANTHROPIC_ENDPOINT && process.env.AZURE_ANTHROPIC_API_KEY) {
-    try {
-      const start = Date.now();
-      const endpoint = process.env.AZURE_ANTHROPIC_ENDPOINT.replace(/\/$/, '');
-      const res = await fetch(`${endpoint}/`, {
-        headers: { 'api-key': process.env.AZURE_ANTHROPIC_API_KEY },
-        signal: AbortSignal.timeout(5000),
-      });
-      // Any response (even 404) means the endpoint is reachable
-      checks.azure_ai = {
-        status: res.status < 500 ? 'healthy' : 'unavailable',
-        latency: Date.now() - start,
-        ...(res.status >= 500 ? { error: `HTTP ${res.status}` } : {}),
-      };
-    } catch (error: any) {
-      checks.azure_ai = { status: 'unavailable', error: error.message };
-    }
-  } else {
-    checks.azure_ai = { status: 'unavailable', error: 'AZURE_ANTHROPIC_ENDPOINT or AZURE_ANTHROPIC_API_KEY not set' };
-  }
-
-  // Check WhatsApp Cloud API (if configured — not used with Twilio but kept for completeness)
-  if (process.env.WHATSAPP_ACCESS_TOKEN) {
-    try {
-      const { messaging } = await import('@ekatra/messaging');
-      const start = Date.now();
-      const healthy = await messaging.checkHealth();
-      checks.whatsapp = { 
-        status: healthy ? 'healthy' : 'unavailable', 
-        latency: Date.now() - start 
-      };
-    } catch (error: any) {
-      checks.whatsapp = { status: 'unavailable', error: error.message };
-    }
-  }
-
-  const allHealthy = Object.values(checks).every(c => c.status === 'healthy');
-
-  res.status(allHealthy ? 200 : 503).json({
-    status: allHealthy ? 'ready' : 'degraded',
+  const { checkReadiness } = await import('../lib/readiness.js');
+  const { db } = await import('@ekatra/database');
+  const { getRedis } = await import('../lib/redis.js');
+  const redis = getRedis();
+  const result = await checkReadiness({
+    database: async () => { await db.raw('SELECT 1'); },
+    redis: async () => {
+      if (!redis) throw new Error('Redis not configured');
+      if (await redis.ping() !== 'PONG') throw new Error('Redis unavailable');
+    },
+  });
+  res.status(result.ready ? 200 : 503).json({
+    status: result.ready ? 'ready' : 'degraded',
     timestamp: new Date().toISOString(),
-    checks
+    checks: result.checks,
   });
 });
 
@@ -128,7 +65,7 @@ healthRouter.get('/live', (_req: Request, res: Response) => {
  * GET /health/dashboard
  * Dashboard data for admin UI
  */
-healthRouter.get('/dashboard', async (_req: Request, res: Response) => {
+healthRouter.get('/dashboard', authMiddleware, requireRole('super_admin'), async (_req: Request, res: Response) => {
   try {
     // Return mock data if database not available
     const mockData = {
@@ -190,11 +127,13 @@ healthRouter.get('/dashboard', async (_req: Request, res: Response) => {
  * POST /health/test-whatsapp
  * Test WhatsApp connection by sending a test message
  */
-healthRouter.post('/test-whatsapp', async (req: Request, res: Response) => {
+healthRouter.post('/test-whatsapp', authMiddleware, requireRole('super_admin'),
+  rateLimit({ windowMs: 60_000, limit: 5, standardHeaders: true, legacyHeaders: false }),
+  async (req: Request, res: Response) => {
   try {
     const { phoneNumber } = req.body;
     
-    if (!phoneNumber) {
+    if (typeof phoneNumber !== 'string' || !/^\+?[1-9]\d{6,14}$/.test(phoneNumber)) {
       return res.status(400).json({
         success: false,
         error: 'phoneNumber is required'
@@ -202,10 +141,11 @@ healthRouter.post('/test-whatsapp', async (req: Request, res: Response) => {
     }
 
     const { messaging } = await import('@ekatra/messaging');
-    await messaging.sendText(phoneNumber, {
+    const result = await messaging.sendText(phoneNumber, {
       text: `✅ Ekatra WhatsApp connection test successful!\n\nTimestamp: ${new Date().toISOString()}`
     });
 
+    if (!result.success) return res.status(502).json({ success: false, error: 'Provider rejected test message' });
     res.json({
       success: true,
       message: 'Test message sent successfully'

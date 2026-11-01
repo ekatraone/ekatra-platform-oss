@@ -5,10 +5,12 @@
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "type": "module",
+  "files": ["dist"],
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && node scripts/copy-migrations.mjs",
     "dev": "tsc -w",
-    "migrate": "npx tsx src/migrate.ts",
+    "test": "node --import tsx --test src/__tests__/*.test.ts",
+    "migrate": "node --import tsx src/migrate.ts",
     "migrate:prod": "node dist/migrate.js"
   },
   "dependencies": {

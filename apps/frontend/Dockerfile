@@ -1,10 +1,10 @@
 # Build stage
-FROM node:22-alpine AS builder
+FROM node:22.18.0-alpine AS builder
 
 WORKDIR /app
 
 # Install pnpm
-RUN npm install -g pnpm
+RUN npm install -g pnpm@10.28.1
 
 # Copy workspace config + package manifests
 COPY package.json pnpm-workspace.yaml pnpm-lock.yaml ./

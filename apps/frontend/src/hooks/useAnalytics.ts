@@ -17,7 +17,7 @@ export const useAnalytics = () => {
   const baseQuery = useQuery({
     queryKey: ["base-analytics"],
     queryFn: async (): Promise<Omit<AnalyticsData, 'whatsappStats' | 'telegramStats'>> => {
-      const stats = await apiClient.getStats();
+      const { data: stats } = await apiClient.getStats();
       
       return {
         totalUsers: stats.totalUsers || 0,
@@ -40,7 +40,7 @@ export const useAnalytics = () => {
         const startDate = thirtyDaysAgo.toISOString().split('T')[0];
         const endDate = new Date().toISOString().split('T')[0];
         
-        return await fetchWhatsAppAnalytics(startDate, endDate);
+        return await fetchWhatsAppAnalytics();
       } catch (error) {
         console.error("Error fetching WhatsApp analytics:", error);
         return null;

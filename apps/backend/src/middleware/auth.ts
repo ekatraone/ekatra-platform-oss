@@ -9,18 +9,29 @@ import { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
 import { logger } from '../lib/logger.js';
 
-if (!process.env.JWT_SECRET) {
-  const msg = 'FATAL: JWT_SECRET environment variable is not set. Set it before starting the server.';
-  console.error(msg);
-  process.exit(1);
+function jwtSecret(): string {
+  const secret = process.env.JWT_SECRET;
+  if (!secret) throw new Error('JWT_SECRET is required');
+  return secret;
 }
-const JWT_SECRET = process.env.JWT_SECRET;
 
 export interface AuthPayload {
   userId: string;
   email: string;
   role: string;
   organizationId: string;
+}
+
+/** Admin and learner tokens share a signing key in legacy deployments. */
+export function verifyAdminToken(token: string): AuthPayload {
+  const payload = jwt.verify(token, jwtSecret(), { algorithms: ['HS256'] });
+  if (typeof payload === 'string' || payload.role === 'learner' || 'learnerId' in payload ||
+      typeof payload.exp !== 'number' ||
+      !['userId', 'email', 'role', 'organizationId'].every(key =>
+        typeof payload[key] === 'string' && payload[key].trim().length > 0)) {
+    throw new Error('Invalid admin token scope');
+  }
+  return { userId: payload.userId, email: payload.email, role: payload.role, organizationId: payload.organizationId };
 }
 
 // Extend Express Request to carry auth info
@@ -47,7 +58,7 @@ export function authMiddleware(req: Request, res: Response, next: NextFunction):
   const token = header.slice(7);
 
   try {
-    const payload = jwt.verify(token, JWT_SECRET) as AuthPayload;
+    const payload = verifyAdminToken(token);
     req.auth = payload;
     next();
   } catch (err) {
@@ -64,7 +75,7 @@ export function optionalAuth(req: Request, _res: Response, next: NextFunction): 
   const header = req.headers.authorization;
   if (header?.startsWith('Bearer ')) {
     try {
-      req.auth = jwt.verify(header.slice(7), JWT_SECRET) as AuthPayload;
+      req.auth = verifyAdminToken(header.slice(7));
     } catch {
       // Ignore invalid tokens for optional auth
     }
@@ -77,8 +88,8 @@ export function optionalAuth(req: Request, _res: Response, next: NextFunction): 
  * damage from token theft, long enough for a full work session.
  * Use refreshToken() to issue a new token without re-authenticating.
  */
-export function signToken(payload: AuthPayload, expiresIn = '24h'): string {
-  return jwt.sign(payload, JWT_SECRET, { expiresIn } as any);
+export function signToken(payload: AuthPayload, expiresIn: jwt.SignOptions['expiresIn'] = '24h'): string {
+  return jwt.sign(payload, jwtSecret(), { algorithm: 'HS256', expiresIn });
 }
 
 /**

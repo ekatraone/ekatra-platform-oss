@@ -18,8 +18,8 @@ const Dashboard = () => {
   const { data: statsData, isLoading: statsLoading } = useQuery({
     queryKey: ['stats'],
     queryFn: async () => {
-      const res = await apiClient.getStats() as any;
-      return res?.data || res;
+      const res = await apiClient.getStats();
+      return res.data;
     },
     staleTime: 60_000,
   });
@@ -33,7 +33,7 @@ const Dashboard = () => {
   const stats = statsData ? [
     { name: "Total Learners", value: String(statsData.totalUsers ?? 0), change: "", trend: "up" as const },
     { name: "Active Courses", value: String(statsData.activeCourses ?? 0), change: "", trend: "up" as const },
-    { name: "Completion Rate", value: `${statsData.completionRate ?? 0}%`, change: "", trend: (statsData.completionRate >= 70 ? "up" : "down") as const },
+    { name: "Completion Rate", value: `${statsData.completionRate ?? 0}%`, change: "", trend: statsData.completionRate >= 70 ? "up" as const : "down" as const },
     { name: "Messages Sent", value: String(statsData.messagesSent ?? 0), change: "", trend: "up" as const },
   ] : [];
 
