@@ -90,7 +90,7 @@ Authored courses (for example from a spreadsheet) are compiled into this FSM for
 
 ### 3.3 Channels
 
-`packages/messaging` exposes one send call. Learners are addressed by a channel-tagged id: `tg:<chat_id>` routes to Telegram; a phone number routes to WhatsApp. The WhatsApp provider is chosen by configuration (`WHATSAPP_PROVIDER` / `MESSAGING_PROVIDER`): Meta Cloud API by default, with Twilio and a mock provider for testing. Business logic never sees the channel, so adding a channel means implementing one provider interface.
+`packages/messaging` exposes one send call. Learners are addressed by a channel-tagged id: `tg:<chat_id>` routes to Telegram; a phone number routes to WhatsApp. The WhatsApp provider is chosen by configuration (`WHATSAPP_PROVIDER`, either `cloudapi` or `twilio`; if unset, Twilio is used when its credentials exist, otherwise the Meta Cloud API). A mock provider exists for tests, and a WATI adapter is present but not enabled. Business logic never sees the channel, so adding a channel means implementing one provider interface.
 
 `lib/whatsappFormatter.ts` adapts content to WhatsApp limits (3 reply buttons, list messages, character caps).
 

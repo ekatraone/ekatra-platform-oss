@@ -6,7 +6,7 @@ This repository is the infrastructure layer: everything you need to run your own
 
 ## What it does
 
-- **Multi-channel delivery.** One messaging layer routes to WhatsApp (Meta Cloud API or Twilio), Telegram, or a mock provider for testing. Business logic never knows which channel a learner is on.
+- **Multi-channel delivery.** One messaging layer routes to WhatsApp (Meta Cloud API or Twilio) or Telegram. Business logic never knows which channel a learner is on.
 - **Conversation engine.** A finite state machine drives onboarding, course selection or AI generation, lesson delivery, quizzes and Q&A. Courses can be authored as state machines and edited visually.
 - **AI course generation and tutoring.** A model router picks the right model per task (text tiers, images, speech, transcription) across Azure OpenAI, OpenAI and Anthropic, with a retrieval-backed tutor on pgvector.
 - **Scheduling.** Lessons are pushed on each learner's schedule through Redis-backed queues, with retries and a dead-letter path.
@@ -55,7 +55,7 @@ pnpm db:seed                    # optional sample data
 pnpm dev:all                    # backend, frontend and worker in watch mode
 ```
 
-The backend listens on port 3000; health checks are at `/health`. The frontend dev server prints its URL on start. Use `MESSAGING_PROVIDER=mock` to run without WhatsApp or Telegram credentials.
+The backend listens on port 3000; health checks are at `/health`. The frontend dev server prints its URL on start. WhatsApp needs credentials for one provider (`WHATSAPP_PROVIDER` is `cloudapi` or `twilio`); Telegram is optional (`TELEGRAM_BOT_TOKEN`).
 
 Create the first admin once with `POST /api/auth/seed`, protected by the `ADMIN_SEED_KEY` you set in `.env`.
 
@@ -78,7 +78,7 @@ Everything is environment variables. `.env.example` lists them all with placehol
 | `REDIS_URL` | Queues and rate limits |
 | `JWT_SECRET` | Random string, 32+ characters in production |
 | `ADMIN_SEED_KEY` | Guards the one-time admin creation endpoint |
-| `MESSAGING_PROVIDER` / `WHATSAPP_PROVIDER` | `mock`, `cloudapi`, or `twilio` |
+| `WHATSAPP_PROVIDER` | `cloudapi` or `twilio` |
 | `META_*` | WhatsApp Cloud API credentials and webhook verification |
 | `TWILIO_*` | If using Twilio |
 | `TELEGRAM_BOT_TOKEN` | Telegram channel |
